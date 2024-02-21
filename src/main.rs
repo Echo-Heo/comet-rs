@@ -1,9 +1,10 @@
 #![warn(clippy::pedantic)]
+#![allow(clippy::cast_possible_truncation)]
 use clap::Parser;
-use comet::{Emulator, StFlag, CPU};
+use comet::{Emulator, Instruction, StFlag, CPU};
 use ic::IC;
 use mmu::MMU;
-use std::path::PathBuf;
+use std::{mem::size_of, path::PathBuf};
 
 mod comet;
 mod ic;
@@ -30,7 +31,7 @@ struct Args {
     #[arg(short = 'M', long, value_name = "INT", default_value_t = 1 << 26)]
     /// use a custom address space size; the maximum addressable byte will be [int]-1
     /// if not provided, defaults to 2^26 (64 MiB)
-    memory: u64,
+    memory: usize,
 
     #[arg(short, long)]
     /// output benchmark info after execution is halted
@@ -39,7 +40,7 @@ struct Args {
 
 fn comet_main() -> anyhow::Result<()> {
     let args = Args::try_parse()?;
-    let mut mmu = MMU::new(args.memory)?;
+    let mut mmu = MMU::new(args.memory as u64)?;
     let ic = IC::new();
     mmu.load_image(&args.path)?;
     let mut cpu = CPU::new();
@@ -58,6 +59,9 @@ fn comet_main() -> anyhow::Result<()> {
 }
 
 fn main() {
+    if size_of::<usize>() != size_of::<u64>() {
+        println!("WARNING: Running on 32bit target");
+    }
     match comet_main() {
         Ok(()) => {}
         Err(err) => println!("{err}"),

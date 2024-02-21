@@ -1,4 +1,5 @@
 #![warn(clippy::pedantic)]
+#![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::unused_unit)]
 
 use bitfield_struct::bitfield;
@@ -10,7 +11,10 @@ use std::{
     time::Instant,
 };
 
-use crate::{ic::IC, mmu::MMU};
+use crate::{
+    ic::{IntQueueEntry, IC},
+    mmu::{self, MMU},
+};
 
 #[rustfmt::skip]
 #[bitfield(u32)]
@@ -75,6 +79,12 @@ impl Instruction {
     pub const fn zero() -> Self { Instruction { bits: 0 } }
     pub const fn opcode(self) -> u8 { unsafe { self.opcode } }
     pub const fn bits(self) -> u32 { unsafe { self.bits } }
+    pub const fn from_bits(bits: u32) -> Self { Self { bits } }
+    pub const fn e(self) -> E { unsafe { self.e } }
+    pub const fn r(self) -> R { unsafe { self.r } }
+    pub const fn m(self) -> M { unsafe { self.m } }
+    pub const fn f(self) -> F { unsafe { self.f } }
+    pub const fn b(self) -> B { unsafe { self.b } }
 }
 impl Debug for Instruction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -95,7 +105,34 @@ pub enum RegisterName {
     Sp, Fp,
     St,
 }
-
+impl RegisterName {
+    pub const fn from_u8(val: u8) -> Option<Self> {
+        const LIST: [RegisterName; 16] = [
+            RN::Rz,
+            RN::Ra,
+            RN::Rb,
+            RN::Rc,
+            RN::Rd,
+            RN::Re,
+            RN::Rf,
+            RN::Rg,
+            RN::Rh,
+            RN::Ri,
+            RN::Rj,
+            RN::Rk,
+            RN::Ip,
+            RN::Sp,
+            RN::Fp,
+            RN::St,
+        ];
+        if val >= 16 {
+            None
+        } else {
+            Some(LIST[val as usize])
+        }
+    }
+}
+#[macro_export]
 macro_rules! nth_bit {
     ($n: expr) => {
         1 << $n
@@ -117,19 +154,41 @@ bitflags! {
     }
 }
 
+#[repr(u8)]
+#[derive(Debug, Clone, Copy)]
+pub enum ProcMode {
+    Kernel,
+    User,
+}
+impl ProcMode {
+    pub const fn bool(self) -> bool { matches!(self, Self::User) }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Registers(pub [u64; 16]);
 impl Registers {
     pub const fn get_flag(&self, flag: StFlag) -> bool {
-        self.0[RegisterName::St as usize] & flag.bits() == 1
+        self.0[RN::St as usize] & flag.bits() == 1
     }
     pub fn set_flag(&mut self, flag: StFlag, value: bool) {
         if value {
-            self[RegisterName::St] |= flag.bits();
+            self[RN::St] |= flag.bits();
         } else {
-            self[RegisterName::St] &= !flag.bits();
+            self[RN::St] &= !flag.bits();
         }
+    }
+    pub const fn current_instr(&self) -> Instruction {
+        Instruction::from_bits((self.0[RN::St as usize] >> 32) as u32)
+    }
+    pub fn set_current_instr(&mut self, instruction: Instruction) {
+        unsafe {
+            (self.0[RN::St as usize] as *mut u64)
+                .cast::<Instruction>()
+                .offset(1)
+                .write(instruction);
+        }
+        /* self[RN::St] = ((self[RN::St] << 32) >> 32) + ((instruction.bits() as u64) << 32); */
     }
 }
 impl Index<RegisterName> for Registers {
@@ -142,6 +201,32 @@ impl IndexMut<RegisterName> for Registers {
     }
 }
 use RegisterName as RN;
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy)]
+pub enum InterruptErr {
+    DivideByZero = 0,
+    BreakPoint,
+    InvalidInstruction,
+    StackUnderflow,
+    UnalignedAccess,
+    AccessViolation,
+    InterruptOverflow,
+}
+impl InterruptErr {
+    pub const fn from_u8(val: u8) -> Option<Self> {
+        match val {
+            0 => Some(Self::DivideByZero),
+            1 => Some(Self::BreakPoint),
+            2 => Some(Self::InvalidInstruction),
+            3 => Some(Self::StackUnderflow),
+            4 => Some(Self::UnalignedAccess),
+            5 => Some(Self::AccessViolation),
+            6 => Some(Self::InterruptOverflow),
+            _ => None,
+        }
+    }
+}
 
 #[allow(clippy::upper_case_acronyms)]
 #[repr(C)]
@@ -213,15 +298,110 @@ impl Emulator {
             cycle_limit,
         }
     }
-    pub const fn current_instr(&self) -> Instruction {
-        #[allow(clippy::cast_possible_truncation)]
-        Instruction {
-            bits: (self.cpu.registers.0[RN::St as usize] + 1) as u32,
+    pub const fn current_instr(&self) -> Instruction { self.cpu.registers.current_instr() }
+    pub fn set_current_instr(&mut self, instruction: Instruction) {
+        self.cpu.registers.set_current_instr(instruction);
+    }
+
+    fn read_instruction(&self, addr: u64) -> Result<Instruction, mmu::Response> {
+        let mut addr = addr;
+        if self.cpu.get_flag(StFlag::MODE) == ProcMode::User.bool() {
+            addr = self.mmu.translate_address(addr, mmu::AccessMode::Execute)?;
+        }
+        self.mmu.mem_get_u32(addr).map(Instruction::from_bits)
+    }
+    fn read_u8(&self, addr: u64) -> Result<u8, mmu::Response> {
+        let mut addr = addr;
+        if self.cpu.get_flag(StFlag::MODE) {
+            addr = self.mmu.translate_address(addr, mmu::AccessMode::Read)?;
+        }
+        self.mmu.mem_get_u8(addr)
+    }
+    fn read_u16(&self, addr: u64) -> Result<u16, mmu::Response> {
+        let mut addr = addr;
+        if self.cpu.get_flag(StFlag::MODE) {
+            addr = self.mmu.translate_address(addr, mmu::AccessMode::Read)?;
+        }
+        self.mmu.mem_get_u16(addr)
+    }
+    fn read_u32(&self, addr: u64) -> Result<u32, mmu::Response> {
+        let mut addr = addr;
+        if self.cpu.get_flag(StFlag::MODE) {
+            addr = self.mmu.translate_address(addr, mmu::AccessMode::Read)?;
+        }
+        self.mmu.mem_get_u32(addr)
+    }
+    fn read_u64(&self, addr: u64) -> Result<u64, mmu::Response> {
+        let mut addr = addr;
+        if self.cpu.get_flag(StFlag::MODE) {
+            addr = self.mmu.translate_address(addr, mmu::AccessMode::Read)?;
+        }
+        self.mmu.mem_get_u64(addr)
+    }
+    fn read_u128(&self, addr: u64) -> Result<u128, mmu::Response> {
+        let mut addr = addr;
+        if self.cpu.get_flag(StFlag::MODE) {
+            addr = self.mmu.translate_address(addr, mmu::AccessMode::Read)?;
+        }
+        self.mmu.mem_get_u128(addr)
+    }
+
+    fn push_interrupt(&mut self, err: InterruptErr) {
+        let mut err = err;
+        if self.ic.queue.is_empty() {
+            self.ic.ret_addr = self.cpu.registers[RN::Ip];
+            self.ic.ret_status = self.cpu.registers[RN::St];
+            self.cpu.set_flag(StFlag::MODE, ProcMode::User.bool());
+        }
+        if self.ic.queue.len() == self.ic.queue.capacity() {
+            // interrupt queue overflow
+            self.ic.queue.clear();
+            err = InterruptErr::InterruptOverflow;
+        }
+        // hijack instruction pointer
+        match self.mmu.phys_read_u64(
+            self.ic.ivt_base_address + 8 * err as u64,
+            &mut self.cpu.registers[RN::Ip],
+        ) {
+            Err(err) => {
+                self.push_interrupt_from_mmu(err);
+            }
+            Ok(()) => {
+                self.ic.queue.push(IntQueueEntry { code: err as u8 });
+            }
+        }
+    }
+    fn push_interrupt_from_mmu(&mut self, res: mmu::Response) {
+        self.push_interrupt(res.to_interrupt_err());
+    }
+
+    fn return_interrupt(&mut self) {
+        if self.ic.queue.is_empty() {
+            return;
+        }
+
+        let _ = self.ic.queue.remove(0);
+        if self.ic.queue.is_empty() {
+            self.cpu.registers[RN::Ip] = self.ic.ret_addr;
+            self.cpu.registers[RN::St] = self.ic.ret_status;
+        } else {
+            // hijack instruction pointer
+            let code = self.ic.queue[self.ic.queue.len() - 1].code;
+            match self
+                .mmu
+                .mem_get_u64(self.ic.ivt_base_address + 8 * code as u64)
+            {
+                Err(err) => self.push_interrupt_from_mmu(err),
+                Ok(res) => self.cpu.registers[RN::Ip] = res,
+            }
         }
     }
     pub const fn regval(&self, reg: RegisterName) -> u64 { self.cpu.registers.0[reg as usize] }
     pub fn regval_mut(&mut self, reg: RegisterName) -> &mut u64 {
         &mut self.cpu.registers.0[reg as usize]
+    }
+    pub const fn proc_mode_is_user(&self) -> bool {
+        self.cpu.get_flag(StFlag::MODE) == ProcMode::User.bool()
     }
     pub fn run_internal(&mut self) -> anyhow::Result<()> {
         self.cpu.cycle += 1;
@@ -230,6 +410,53 @@ impl Emulator {
             self.regval(RN::Ip),
             self.current_instr().opcode()
         );
+
+        // load instruction
+        match self.read_instruction(self.regval(RN::Ip)) {
+            Ok(instr) => self.set_current_instr(instr),
+            Err(err) => {
+                self.push_interrupt_from_mmu(err);
+                return Ok(());
+            }
+        }
+
+        *self.regval_mut(RN::Ip) += 4;
+
+        let ci = self.current_instr();
+        match ci.opcode() {
+            // System control
+            0x01 => match unsafe { ci.f }.func() {
+                // int
+                0x00 => self.push_interrupt(InterruptErr::from_u8(ci.f().imm() as u8).unwrap()),
+                // iret | ires
+                0x01 | 0x02 => {
+                    if self.proc_mode_is_user() {
+                        self.push_interrupt(InterruptErr::InvalidInstruction);
+                    } else {
+                        self.return_interrupt();
+                    }
+                }
+                // usr
+                0x03 => {
+                    if self.proc_mode_is_user() {
+                        self.push_interrupt(InterruptErr::InvalidInstruction);
+                    } else {
+                        self.cpu.set_flag(StFlag::MODE, ProcMode::User.bool());
+                        self.cpu.registers[RN::Ip] = self.regval(RN::from_u8(ci.f().rde() as u8).unwrap());
+                    }
+                }
+                _ => unreachable!(),
+            },
+            // outr
+            0x02 => {
+                if self.proc_mode_is_user() {
+                    self.push_interrupt(InterruptErr::InvalidInstruction);
+                } else {
+                    todo!()
+                }
+            }
+            _ => todo!(),
+        }
 
         todo!()
     }
