@@ -1,10 +1,13 @@
 #![warn(clippy::pedantic)]
 use clap::Parser;
+use comet::{Emulator, StFlag, CPU};
+use ic::IC;
+use mmu::MMU;
 use std::path::PathBuf;
 
-use crate::comet::Instruction;
-
 mod comet;
+mod ic;
+mod mmu;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -24,18 +27,39 @@ struct Args {
     /// halt after cycle count has been reached (will run forever if unset)
     max_cycles: usize,
 
-    #[arg(short = 'M', long, value_name = "INT", default_value_t = 0)]
+    #[arg(short = 'M', long, value_name = "INT", default_value_t = 1 << 26)]
     /// use a custom address space size; the maximum addressable byte will be [int]-1
     /// if not provided, defaults to 2^26 (64 MiB)
-    memory: usize,
+    memory: u64,
 
     #[arg(short, long)]
     /// output benchmark info after execution is halted
     bench: bool,
 }
 
-fn main() { let args = Args::parse(); 
-    let a: comet::B = dbg!(unsafe{Instruction { opcode: 0 }.b});
-    let b = a.func();
-    dbg!(b);
+fn comet_main() -> anyhow::Result<()> {
+    let args = Args::try_parse()?;
+    let mut mmu = MMU::new(args.memory)?;
+    let ic = IC::new();
+    mmu.load_image(&args.path)?;
+    let mut cpu = CPU::new();
+    cpu.set_flag(StFlag::EXT_F, true);
+
+    let comet = Emulator::new(cpu, ic, mmu, args.debug, args.max_cycles);
+
+    let result = comet.run()?;
+    if args.bench {
+        println!("\ttime      : {}s", result.elapsed);
+        println!("\tcycles    : {}", result.cycle);
+        println!("\tcycles/s  : {:.3}", result.cycle_per_sec());
+    }
+
+    Ok(())
+}
+
+fn main() {
+    match comet_main() {
+        Ok(()) => {}
+        Err(err) => println!("{err}"),
+    }
 }
