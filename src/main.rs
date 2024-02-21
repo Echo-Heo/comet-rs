@@ -9,6 +9,7 @@ use std::{mem::size_of, path::PathBuf};
 mod comet;
 mod ic;
 mod mmu;
+mod io;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -48,7 +49,7 @@ fn comet_main() -> anyhow::Result<()> {
 
     let comet = Emulator::new(cpu, ic, mmu, args.debug, args.max_cycles);
 
-    let result = comet.run()?;
+    let result = comet.run();
     if args.bench {
         println!("\ttime      : {}s", result.elapsed);
         println!("\tcycles    : {}", result.cycle);

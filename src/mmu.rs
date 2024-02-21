@@ -80,64 +80,90 @@ impl MMU {
         }
         Ok(())
     }
-    
-    pub fn mem_get_sized<const SIZE: usize>(
-        &self, addr: usize,
-    ) -> Result<&'_ [u8; SIZE], Response> {
-        if addr as u64 > self.mem_max() {
+
+    pub fn phys_get_sized<const SIZE: usize>(&self, addr: u64) -> Result<&'_ [u8; SIZE], Response> {
+        if addr > self.mem_max() {
             Err(Response::OutOfBounds)
-        } else if addr % SIZE != 0 {
+        } else if addr as usize % SIZE != 0 {
             Err(Response::Unaligned)
         } else {
-            Ok(self.memory[addr..].first_chunk::<SIZE>().unwrap())
+            Ok(self.memory[addr as usize..].first_chunk::<SIZE>().unwrap())
         }
     }
-    pub fn mem_get_u8(&self, addr: u64) -> Result<u8, Response> {
-        let [res] = self.mem_get_sized::<{ size_of::<u8>() }>(addr as usize)?;
+    pub fn phys_write_sized<const SIZE: usize>(
+        &mut self, addr: u64, what: [u8; SIZE],
+    ) -> Result<(), Response> {
+        if addr > self.mem_max() {
+            Err(Response::OutOfBounds)
+        } else if addr as usize % SIZE != 0 {
+            Err(Response::Unaligned)
+        } else {
+            *self.memory[addr as usize..]
+                .first_chunk_mut::<SIZE>()
+                .unwrap() = what;
+            Ok(())
+        }
+    }
+    pub fn phys_get_u8(&self, addr: u64) -> Result<u8, Response> {
+        let [res] = self.phys_get_sized::<{ size_of::<u8>() }>(addr)?;
         Ok(*res)
     }
-    pub fn mem_get_u16(&self, addr: u64) -> Result<u16, Response> {
-        let bytes = self.mem_get_sized::<{ size_of::<u16>() }>(addr as usize)?;
+    pub fn phys_get_u16(&self, addr: u64) -> Result<u16, Response> {
+        let bytes = self.phys_get_sized::<{ size_of::<u16>() }>(addr)?;
+        // ? What to do with endianness?
         Ok(u16::from_ne_bytes(*bytes))
     }
-    pub fn mem_get_u32(&self, addr: u64) -> Result<u32, Response> {
-        let bytes = self.mem_get_sized::<{ size_of::<u32>() }>(addr as usize)?;
+    pub fn phys_get_u32(&self, addr: u64) -> Result<u32, Response> {
+        let bytes = self.phys_get_sized::<{ size_of::<u32>() }>(addr)?;
         Ok(u32::from_ne_bytes(*bytes))
     }
-    pub fn mem_get_u64(&self, addr: u64) -> Result<u64, Response> {
-        let bytes = self.mem_get_sized::<{ size_of::<u64>() }>(addr as usize)?;
+    pub fn phys_get_u64(&self, addr: u64) -> Result<u64, Response> {
+        let bytes = self.phys_get_sized::<{ size_of::<u64>() }>(addr)?;
         Ok(u64::from_ne_bytes(*bytes))
     }
-    pub fn mem_get_u128(&self, addr: u64) -> Result<u128, Response> {
-        let bytes = self.mem_get_sized::<{ size_of::<u128>() }>(addr as usize)?;
+    pub fn phys_get_u128(&self, addr: u64) -> Result<u128, Response> {
+        let bytes = self.phys_get_sized::<{ size_of::<u128>() }>(addr)?;
         Ok(u128::from_ne_bytes(*bytes))
     }
     // physical read/write
 
     pub fn phys_read_u8(&self, addr: u64, var: &mut u8) -> Result<(), Response> {
-        *var = self.mem_get_u8(addr)?;
+        *var = self.phys_get_u8(addr)?;
         Ok(())
     }
     pub fn phys_read_u16(&self, addr: u64, var: &mut u16) -> Result<(), Response> {
-        *var = self.mem_get_u16(addr)?;
+        *var = self.phys_get_u16(addr)?;
         Ok(())
     }
     pub fn phys_read_u32(&self, addr: u64, var: &mut u32) -> Result<(), Response> {
-        *var = self.mem_get_u32(addr)?;
+        *var = self.phys_get_u32(addr)?;
         Ok(())
     }
     pub fn phys_read_u64(&self, addr: u64, var: &mut u64) -> Result<(), Response> {
-        *var = self.mem_get_u64(addr)?;
+        *var = self.phys_get_u64(addr)?;
         Ok(())
     }
     pub fn phys_read_u128(&self, addr: u64, var: &mut u128) -> Result<(), Response> {
-        *var = self.mem_get_u128(addr)?;
+        *var = self.phys_get_u128(addr)?;
         Ok(())
     }
+    pub fn phys_write_u8(&mut self, addr: u64, value: u8) -> Result<(), Response> {
+        self.phys_write_sized(addr, value.to_ne_bytes())
+    }
+    pub fn phys_write_u16(&mut self, addr: u64, value: u16) -> Result<(), Response> {
+        self.phys_write_sized(addr, value.to_ne_bytes())
+    }
+    pub fn phys_write_u32(&mut self, addr: u64, value: u32) -> Result<(), Response> {
+        self.phys_write_sized(addr, value.to_ne_bytes())
+    }
+    pub fn phys_write_u64(&mut self, addr: u64, value: u64) -> Result<(), Response> {
+        self.phys_write_sized(addr, value.to_ne_bytes())
+    }
+    pub fn phys_write_u128(&mut self, addr: u64, value: u128) -> Result<(), Response> {
+        self.phys_write_sized(addr, value.to_ne_bytes())
+    }
 
-    pub fn translate_address(
-        &self, r#virtual: u64, mode: AccessMode,
-    ) -> Result<u64, Response> {
+    pub fn translate_address(&self, r#virtual: u64, mode: AccessMode) -> Result<u64, Response> {
         let level_1_index = ((0b11_1111u64 << 58) & r#virtual) >> 58;
         let level_2_index = ((0b111_1111_1111u64 << 47) & r#virtual) >> 47;
         let level_3_index = ((0b111_1111_1111u64 << 36) & r#virtual) >> 36;
@@ -165,7 +191,7 @@ impl MMU {
     fn translate_address_level(
         &self, next: u64, level_index: u64, mode: AccessMode,
     ) -> Result<u64, Response> {
-        let pde = match self.mem_get_u64(next + level_index * 8) {
+        let pde = match self.phys_get_u64(next + level_index * 8) {
             Ok(pde) if pde & 1 != 0 => pde,
             _ => return Err(Response::AccViolation),
         };
