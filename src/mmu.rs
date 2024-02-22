@@ -1,7 +1,6 @@
-#![warn(clippy::pedantic)]
 #![allow(clippy::cast_possible_truncation)]
 
-use crate::{comet::Instruction, nth_bit};
+use crate::nth_bit;
 use std::{
     fs::File,
     io::{Read, Seek},
@@ -51,25 +50,14 @@ pub struct MMU {
 pub struct MMUInitError;
 impl MMU {
     pub const fn mem_max(&self) -> u64 { (self.memory.len() - 1) as u64 }
-    pub const fn mem_max_usize(&self) -> usize { self.memory.len() - 1 }
     pub const fn mem_len(&self) -> u64 { self.memory.len() as u64 }
-    pub const fn mem_len_usize(&self) -> usize { self.memory.len() }
     fn new_option(mem_cap: u64) -> Option<Self> {
-        let mem_cap = if mem_cap == 0 {
-            MEM_DEFAULT_SIZE
-        } else {
-            mem_cap
-        };
+        let mem_cap = if mem_cap == 0 { MEM_DEFAULT_SIZE } else { mem_cap };
         let capacity = mem_cap.try_into().ok()?;
         let memory = vec![0; capacity].into_boxed_slice();
-        Some(Self {
-            memory,
-            page_table_base: 0,
-        })
+        Some(Self { memory, page_table_base: 0 })
     }
-    pub fn new(mem_cap: u64) -> Result<Self, MMUInitError> {
-        Self::new_option(mem_cap).ok_or(MMUInitError)
-    }
+    pub fn new(mem_cap: u64) -> Result<Self, MMUInitError> { Self::new_option(mem_cap).ok_or(MMUInitError) }
     pub fn load_image(&mut self, path: &Path) -> anyhow::Result<()> {
         let mut bin = File::open(path)?;
         let bin_size = bin.seek(std::io::SeekFrom::End(0))?;
@@ -90,17 +78,13 @@ impl MMU {
             Ok(self.memory[addr as usize..].first_chunk::<SIZE>().unwrap())
         }
     }
-    pub fn phys_write_sized<const SIZE: usize>(
-        &mut self, addr: u64, what: [u8; SIZE],
-    ) -> Result<(), Response> {
+    pub fn phys_write_sized<const SIZE: usize>(&mut self, addr: u64, what: [u8; SIZE]) -> Result<(), Response> {
         if addr > self.mem_max() {
             Err(Response::OutOfBounds)
         } else if addr as usize % SIZE != 0 {
             Err(Response::Unaligned)
         } else {
-            *self.memory[addr as usize..]
-                .first_chunk_mut::<SIZE>()
-                .unwrap() = what;
+            *self.memory[addr as usize..].first_chunk_mut::<SIZE>().unwrap() = what;
             Ok(())
         }
     }
@@ -121,10 +105,7 @@ impl MMU {
         let bytes = self.phys_get_sized::<{ size_of::<u64>() }>(addr)?;
         Ok(u64::from_ne_bytes(*bytes))
     }
-    pub fn phys_get_u128(&self, addr: u64) -> Result<u128, Response> {
-        let bytes = self.phys_get_sized::<{ size_of::<u128>() }>(addr)?;
-        Ok(u128::from_ne_bytes(*bytes))
-    }
+
     // physical read/write
 
     pub fn phys_read_u8(&self, addr: u64, var: &mut u8) -> Result<(), Response> {
@@ -143,25 +124,11 @@ impl MMU {
         *var = self.phys_get_u64(addr)?;
         Ok(())
     }
-    pub fn phys_read_u128(&self, addr: u64, var: &mut u128) -> Result<(), Response> {
-        *var = self.phys_get_u128(addr)?;
-        Ok(())
-    }
-    pub fn phys_write_u8(&mut self, addr: u64, value: u8) -> Result<(), Response> {
-        self.phys_write_sized(addr, value.to_ne_bytes())
-    }
-    pub fn phys_write_u16(&mut self, addr: u64, value: u16) -> Result<(), Response> {
-        self.phys_write_sized(addr, value.to_ne_bytes())
-    }
-    pub fn phys_write_u32(&mut self, addr: u64, value: u32) -> Result<(), Response> {
-        self.phys_write_sized(addr, value.to_ne_bytes())
-    }
-    pub fn phys_write_u64(&mut self, addr: u64, value: u64) -> Result<(), Response> {
-        self.phys_write_sized(addr, value.to_ne_bytes())
-    }
-    pub fn phys_write_u128(&mut self, addr: u64, value: u128) -> Result<(), Response> {
-        self.phys_write_sized(addr, value.to_ne_bytes())
-    }
+
+    pub fn phys_write_u8(&mut self, addr: u64, value: u8) -> Result<(), Response> { self.phys_write_sized(addr, value.to_ne_bytes()) }
+    pub fn phys_write_u16(&mut self, addr: u64, value: u16) -> Result<(), Response> { self.phys_write_sized(addr, value.to_ne_bytes()) }
+    pub fn phys_write_u32(&mut self, addr: u64, value: u32) -> Result<(), Response> { self.phys_write_sized(addr, value.to_ne_bytes()) }
+    pub fn phys_write_u64(&mut self, addr: u64, value: u64) -> Result<(), Response> { self.phys_write_sized(addr, value.to_ne_bytes()) }
 
     pub fn translate_address(&self, r#virtual: u64, mode: AccessMode) -> Result<u64, Response> {
         let level_1_index = ((0b11_1111u64 << 58) & r#virtual) >> 58;
@@ -188,9 +155,7 @@ impl MMU {
         Ok(next + level_6_index)
     }
 
-    fn translate_address_level(
-        &self, next: u64, level_index: u64, mode: AccessMode,
-    ) -> Result<u64, Response> {
+    fn translate_address_level(&self, next: u64, level_index: u64, mode: AccessMode) -> Result<u64, Response> {
         let pde = match self.phys_get_u64(next + level_index * 8) {
             Ok(pde) if pde & 1 != 0 => pde,
             _ => return Err(Response::AccViolation),

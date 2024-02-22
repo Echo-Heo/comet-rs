@@ -5,4 +5,4 @@ fn_params_layout = "Compressed"
 fn_args_layout = "Compressed" # deprecated but used here cause it doesnt show when i hover for some reason
 brace_style ="PreferSameLine"
 fn_single_line = true
-max_width = 100
+max_width = 150

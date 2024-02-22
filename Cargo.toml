@@ -1,7 +1,10 @@
 [package]
 name = "comet-rs"
 version = "0.1.0"
+authors = ["Echo Heo <jeannebluemonheo@gmail.com>"]
 edition = "2021"
+description = "RIIR of https://github.com/orbit-systems/comet"
+publish = false
 
 [dependencies]
 anyhow = "1.0.80"
@@ -9,5 +12,12 @@ bitfield-struct = "0.6.0"
 bitflags = "2.4.2"
 bytemuck = "1.14.3"
 clap = { version = "4.5.1", features = ["derive"] }
+half = { version = "2.3.1", features = ["std"] }
 sa = "2.0.0"
 thiserror = "1.0.57"
+
+[lints.clippy]
+pedantic = "warn"
+
+[lints.rust]
+dead_code = "allow"
