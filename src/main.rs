@@ -1,14 +1,18 @@
 #![allow(clippy::cast_possible_truncation)]
+#![deny(unsafe_code)]
+
 use clap::Parser;
 use comet::{Emulator, StFlag, CPU};
 use ic::IC;
 use mmu::MMU;
-use std::{mem::size_of, path::PathBuf};
+use std::path::PathBuf;
 
 mod comet;
 mod ic;
 mod io;
 mod mmu;
+mod opcode;
+mod safety;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,13 +42,6 @@ struct Args {
     bench: bool,
 }
 
-pub const fn unsafe_read<T, U: Copy>(what: &T, offset: isize) -> U { unsafe { std::ptr::from_ref::<T>(what).cast::<U>().offset(offset).read() } }
-
-pub fn unsafe_write<T, U: Copy>(what: &mut T, value: U, offset: isize) {
-    unsafe {
-        std::ptr::from_mut::<T>(what).cast::<U>().offset(offset).write(value);
-    }
-}
 
 fn comet_main() -> anyhow::Result<()> {
     let args = Args::try_parse()?;
@@ -62,19 +59,10 @@ fn comet_main() -> anyhow::Result<()> {
         println!("\tcycles    : {}", result.cycle);
         println!("\tcycles/s  : {:.3}", result.cycle_per_sec());
     }
-
     Ok(())
 }
 
 fn main() {
-    if size_of::<usize>() != size_of::<u64>() {
-        println!("WARNING: Running on 32bit target, might cause unintended behavior");
-    }
-    #[cfg(target_endian = "big")]
-    {
-        compile_error!("Big endian not supported!")
-    }
-
     match comet_main() {
         Ok(()) => {}
         Err(err) => println!("{err}"),

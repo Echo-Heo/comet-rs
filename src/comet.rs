@@ -1,14 +1,13 @@
+#![warn(clippy::pedantic)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_lossless)]
 #![allow(clippy::cast_precision_loss)]
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::cast_possible_wrap)]
-#![allow(clippy::unused_unit)]
-#![allow(clippy::too_many_lines)]
+#![deny(unsafe_code)]
 
-use bitfield_struct::bitfield;
+
 use bitflags::bitflags;
-use sa::static_assert;
 use std::{
     fmt::Debug,
     ops::{Add, AddAssign, Div, Index, IndexMut, Mul, Neg, Sub},
@@ -17,9 +16,10 @@ use std::{
 
 use crate::{
     ic::{IntQueueEntry, IC},
-    io::IOC,
+    io::{Ports, IOC},
     mmu::{self, MMU},
-    unsafe_read, unsafe_write,
+    opcode::Opcode,
+    safety::{BitAccess, FloatCastType, FloatPrecision, Instruction, Interrupt, LiType, Nibble, Register},
 };
 use half::f16;
 
@@ -33,58 +33,24 @@ macro_rules! sign_extend {
         (((($val as u64) << (64 - $bitsize)) as u64) >> (64 - $bitsize)) as u64
     };
 } */
-macro_rules! get_usize {
-    ($ident: ident.$($ident2: ident).*) => {
-        $ident.$($ident2()).* as usize
-    };
-}
+
 macro_rules! arithmetic {
-    ($self: ident, $ci: ident, $func: ident, r) => {{
-        let a = $self.regval_n(get_usize!($ci.r.rs1));
-        let b = $self.regval_n(get_usize!($ci.r.rs2));
-        let reg = get_usize!($ci.r.rde);
-        $self.$func(a, b, reg);
-    }};
-    ($self: ident, $ci: ident, $func: ident, i) => {{
-        let a = $self.regval_n(get_usize!($ci.m.rs1));
-        let b = sign_extend!($ci.m().imm(), 16);
-        let reg = get_usize!($ci.m.rde);
-        $self.$func(a, b, reg);
-    }};
+    ($self: ident.$func: ident (*$r1: ident, *$r2: ident) -> $rd: ident) => {
+        $self.$func($self.regval($r1), $self.regval($r2), $rd)
+    };
+    ($self: ident.$func: ident (*$r1: ident, $imm: ident) -> $rd: ident) => {
+        $self.$func($self.regval($r1), sign_extend!($imm, 16), $rd)
+    };
 }
 macro_rules! bitwise {
-    ($self: ident, $ci: ident, $func: ident, r) => {{
-        let a = $self.regval_n(get_usize!($ci.r.rs1));
-        let b = $self.regval_n(get_usize!($ci.r.rs2));
-        let reg = get_usize!($ci.r.rde);
-        $self.$func(a, b, reg);
-    }};
-    ($self: ident, $ci: ident, $func: ident, i) => {{
-        let a = $self.regval_n(get_usize!($ci.m.rs1));
-        let b = $ci.m().imm() as u64;
-        let reg = get_usize!($ci.m.rde);
-        $self.$func(a, b, reg);
-    }};
-}
-macro_rules! make_comp {
-    ($self: ident, $a: ident, $b: ident) => {{
-        $self.cpu.set_flag(StFlag::EQUAL, $a == $b);
-        $self.cpu.set_flag(StFlag::LESS, ($a as i64) < ($b as i64));
-        $self.cpu.set_flag(StFlag::LESS_UNSIGNED, $a < $b);
-        $self.cpu.set_flag(StFlag::SIGN, ($a as i64) < 0);
-        $self.cpu.set_flag(StFlag::ZERO, $a == 0);
-    }};
-    ($self: ident, $a: ident, $b: ident, $T: ty) => {
-        #[allow(clippy::float_cmp)]
-        {
-            $self.cpu.set_flag(StFlag::EQUAL, $a == $b);
-            $self.cpu.set_flag(StFlag::LESS, $a < $b);
-            $self.cpu.set_flag(StFlag::LESS_UNSIGNED, $a < $b);
-            $self.cpu.set_flag(StFlag::SIGN, $a < <$T>::ZERO);
-            $self.cpu.set_flag(StFlag::ZERO, $a == <$T>::ZERO);
-        }
+    ($self: ident.$func: ident (*$r1: ident, *$r2: ident) -> $rd: ident) => {
+        $self.$func($self.regval($r1), $self.regval($r2), $rd)
+    };
+    ($self: ident.$func: ident (*$r1: ident, $imm: ident) -> $rd: ident) => {
+        $self.$func($self.regval($r1), $imm as u64, $rd)
     };
 }
+
 trait Float:
     Sized
     + Copy
@@ -97,21 +63,29 @@ trait Float:
     + PartialEq
     + PartialOrd {
     const ZERO: Self;
-    type IntType: Into<u64> + Copy;
+    type IntType: Copy + Into<u64>;
     fn to_bits(self) -> Self::IntType;
+    fn from_bits(v: Self::IntType) -> Self;
     /// bit preserving cast
-    fn from_bits_u64(v: u64) -> Self { unsafe_read(&v, 0) }
-    fn add_assign_bits(self, to: &mut u64) { *unsafe { std::ptr::from_mut::<u64>(to).cast::<Self>().as_mut().unwrap() } += self; }
-    /// bit preserving cast
-    fn to_bits_u64(self) -> u64 { self.to_bits().into() }
-    /// overriding bit preserving cast
+    fn from_bits_u64(v: u64) -> Self
+    where
+        u64: BitAccess<Self::IntType>, {
+        Self::from_bits(<u64 as BitAccess<Self::IntType>>::access(v, 0))
+    }
+    // /// bit preserving cast
+    // fn to_bits_u64(self) -> u64 { self.to_bits().into() }
+    /* /// overriding bit preserving cast
     // probably doesnt need unsafe write
-    fn to_bits_to_u64(self, v: &mut u64) { unsafe_write(v, self.to_bits(), 0) }
+    fn to_bits_to_u64(self, v: &mut u64)
+    where
+        u64: BitAccess<Self::IntType>, {
+        v.write(0, self.to_bits());
+    } */
 
     /// arithmetic cast
-    fn from_int(v: u64) -> Self;
+    fn from_int(v: i64) -> Self;
     /// arithmetic cast
-    fn to_int(self) -> u64;
+    fn to_int(self) -> i64;
     fn abs(self) -> Self;
     fn is_zero(self) -> bool { self == Self::ZERO }
     fn sqrt(self) -> Self;
@@ -124,9 +98,10 @@ trait Float:
 impl Float for f16 {
     const ZERO: Self = Self::ZERO;
     type IntType = u16;
+    fn from_bits(v: Self::IntType) -> Self { f16::from_bits(v) }
     fn to_bits(self) -> Self::IntType { self.to_bits() }
-    fn from_int(v: u64) -> Self { f16::from_f64(v as f64) }
-    fn to_int(self) -> u64 { self.to_f64() as u64 }
+    fn from_int(v: i64) -> Self { f16::from_f64(v as f64) }
+    fn to_int(self) -> i64 { self.to_f64() as i64 }
     #[rustfmt::skip]
     fn abs(self) -> Self { if self.is_sign_negative() { -self } else { self } }
     fn sqrt(self) -> Self { f16::from_f64_const(self.to_f64_const().sqrt()) }
@@ -139,9 +114,10 @@ impl Float for f16 {
 impl Float for f32 {
     const ZERO: Self = 0.0;
     type IntType = u32;
+    fn from_bits(v: Self::IntType) -> Self { Self::from_bits(v) }
     fn to_bits(self) -> Self::IntType { self.to_bits() }
-    fn from_int(v: u64) -> Self { v as Self }
-    fn to_int(self) -> u64 { self as u64 }
+    fn from_int(v: i64) -> Self { v as Self }
+    fn to_int(self) -> i64 { self as i64 }
     fn abs(self) -> Self { self.abs() }
     fn sqrt(self) -> Self { self.sqrt() }
     fn min(self, other: Self) -> Self { self.min(other) }
@@ -152,9 +128,10 @@ impl Float for f32 {
 impl Float for f64 {
     const ZERO: Self = 0.0;
     type IntType = u64;
+    fn from_bits(v: Self::IntType) -> Self { Self::from_bits(v) }
     fn to_bits(self) -> Self::IntType { self.to_bits() }
-    fn from_int(v: u64) -> Self { v as Self }
-    fn to_int(self) -> u64 { self as u64 }
+    fn from_int(v: i64) -> Self { v as Self }
+    fn to_int(self) -> i64 { self as i64 }
     fn abs(self) -> Self { self.abs() }
     fn sqrt(self) -> Self { self.sqrt() }
     fn min(self, other: Self) -> Self { self.min(other) }
@@ -186,155 +163,13 @@ impl FloatFrom<f32> for f64 {
 impl<T: Float> FloatFrom<T> for T {
     fn from(v: T) -> Self { v }
 }
-trait FloatTo<F: Float>: Float {
+/* trait FloatTo<F: Float>: Float {
     fn to(self) -> F;
-}
-impl<From: Float, F: FloatFrom<From>> FloatTo<F> for From {
+} */
+/* impl<From: Float, F: FloatFrom<From>> FloatTo<F> for From {
     fn to(self) -> F { F::from(self) }
-}
+} */
 
-#[rustfmt::skip]
-#[bitfield(u32)]
-#[derive(PartialEq, Eq)]
-struct E {
-    #[bits(8)]  opcode: u32,
-    #[bits(8)]  imm:    u32,
-    #[bits(4)]  func:   u32,
-    #[bits(4)]  rs2:    u32,
-    #[bits(4)]  rs1:    u32,
-    #[bits(4)]  rde:    u32,
-}
-#[rustfmt::skip]
-#[bitfield(u32)]
-#[derive(PartialEq, Eq)]
-struct R {
-    #[bits(8)]  opcode: u32,
-    #[bits(12)] imm:    u32,
-    #[bits(4)]  rs2:    u32,
-    #[bits(4)]  rs1:    u32,
-    #[bits(4)]  rde:    u32,
-}
-#[rustfmt::skip]
-#[bitfield(u32)]
-#[derive(PartialEq, Eq)]
-struct M {
-    #[bits(8)]  opcode: u32,
-    #[bits(16)] imm:    u32,
-    #[bits(4)]  rs1:    u32,
-    #[bits(4)]  rde:    u32,
-}
-#[rustfmt::skip]
-#[bitfield(u32)]
-#[derive(PartialEq, Eq)]
-struct F {
-    #[bits(8)]  opcode: u32,
-    #[bits(16)] imm:    u32,
-    #[bits(4)]  func:   u32,
-    #[bits(4)]  rde:    u32,
-}
-#[rustfmt::skip]
-#[bitfield(u32)]
-#[derive(PartialEq, Eq)]
-struct B {
-    #[bits(8)]  opcode: u32,
-    #[bits(20)] imm:    u32,
-    #[bits(4)]  func:   u32,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-union Instruction {
-    opcode: u8,
-    bits:   u32,
-    e:      E,
-    r:      R,
-    m:      M,
-    f:      F,
-    b:      B,
-}
-impl Instruction {
-    const fn zero() -> Self { Instruction { bits: 0 } }
-    const fn opcode(self) -> u8 { unsafe { self.opcode } }
-    const fn bits(self) -> u32 { unsafe { self.bits } }
-    const fn from_bits(bits: u32) -> Self { Self { bits } }
-    const fn e(self) -> E { unsafe { self.e } }
-    const fn r(self) -> R { unsafe { self.r } }
-    const fn m(self) -> M { unsafe { self.m } }
-    const fn f(self) -> F { unsafe { self.f } }
-    const fn b(self) -> B { unsafe { self.b } }
-}
-impl Debug for Instruction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{:b}", self.bits()) }
-}
-static_assert!(core::mem::size_of::<Instruction>() == core::mem::size_of::<u32>());
-
-#[rustfmt::skip]
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-pub enum RegisterName {
-    Rz,
-    Ra, Rb, Rc, Rd,
-    Re, Rf, Rg, Rh,
-    Ri, Rj, Rk,
-    Ip,
-    Sp, Fp,
-    St,
-}
-impl RegisterName {
-    const fn try_from_u8(val: u8) -> Option<Self> {
-        const LIST: [RegisterName; 16] = [
-            RN::Rz,
-            RN::Ra,
-            RN::Rb,
-            RN::Rc,
-            RN::Rd,
-            RN::Re,
-            RN::Rf,
-            RN::Rg,
-            RN::Rh,
-            RN::Ri,
-            RN::Rj,
-            RN::Rk,
-            RN::Ip,
-            RN::Sp,
-            RN::Fp,
-            RN::St,
-        ];
-        if val >= 16 {
-            None
-        } else {
-            Some(LIST[val as usize])
-        }
-    }
-    /// # Panics
-    ///
-    /// Panics if value is not valid `RegisterName`
-    const fn from_u8(val: u8) -> Self {
-        const LIST: [RegisterName; 16] = [
-            RN::Rz,
-            RN::Ra,
-            RN::Rb,
-            RN::Rc,
-            RN::Rd,
-            RN::Re,
-            RN::Rf,
-            RN::Rg,
-            RN::Rh,
-            RN::Ri,
-            RN::Rj,
-            RN::Rk,
-            RN::Ip,
-            RN::Sp,
-            RN::Fp,
-            RN::St,
-        ];
-        if val >= 16 {
-            panic!()
-        } else {
-            LIST[val as usize]
-        }
-    }
-}
 #[macro_export]
 macro_rules! nth_bit {
     ($n: expr) => {
@@ -343,7 +178,7 @@ macro_rules! nth_bit {
 }
 bitflags! {
     #[derive(Debug, Clone, Copy)]
-    pub struct StFlag: u64 {
+    pub(crate) struct StFlag: u64 {
         const SIGN = nth_bit!(0);
         const ZERO = nth_bit!(1);
         const CARRY_BORROW = nth_bit!(2);
@@ -357,111 +192,84 @@ bitflags! {
     }
 }
 
-#[repr(u8)]
 #[derive(Debug, Clone, Copy)]
-enum ProcMode {
-    Kernel,
-    User,
-}
+struct ProcMode;
 impl ProcMode {
-    const fn bool(self) -> bool { matches!(self, Self::User) }
+    // const KERNEL: bool = false;
+    const USER: bool = true;
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct Registers(pub [u64; 16]);
+struct Registers(pub(crate) [u64; 16]);
 impl Registers {
-    const fn get_flag(&self, flag: StFlag) -> bool { self.0[RN::St as usize] & flag.bits() == 1 }
+    const fn index(&self, index: Register) -> u64 { self.0[index.0 .0 as usize] }
+    const fn get_flag(&self, flag: StFlag) -> bool { self.index(RN::ST) & flag.bits() != 0 }
     fn set_flag(&mut self, flag: StFlag, value: bool) {
         if value {
-            self[RN::St] |= flag.bits();
+            self[RN::ST] |= flag.bits();
         } else {
-            self[RN::St] &= !flag.bits();
+            self[RN::ST] &= !flag.bits();
         }
     }
-    const fn current_instr(&self) -> Instruction { unsafe_read(&self.0[RN::St as usize], 1) }
-    fn set_current_instr(&mut self, instruction: Instruction) {
-        unsafe_write(&mut self[RN::St], instruction, 1);
-        /* self[RN::St] = ((self[RN::St] << 32) >> 32) + ((instruction.bits() as u64) << 32); */
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn set_cmp(&mut self, equal: bool, less: bool, less_unsigned: bool, sign: bool, zero: bool) {
+        self.set_flag(StFlag::EQUAL, equal);
+        self.set_flag(StFlag::LESS, less);
+        self.set_flag(StFlag::LESS_UNSIGNED, less_unsigned);
+        self.set_flag(StFlag::SIGN, sign);
+        self.set_flag(StFlag::ZERO, zero);
     }
+    fn current_instr(&self) -> Instruction { Instruction(self[RN::ST].access(1)) }
+    fn set_current_instr(&mut self, instruction: Instruction) { self[RN::ST].write(1, instruction.0); }
 }
-impl Index<RegisterName> for Registers {
+impl Index<Register> for Registers {
     type Output = u64;
-    fn index(&self, index: RegisterName) -> &Self::Output { &self.0[index as usize] }
+    fn index(&self, index: Register) -> &Self::Output { &self.0[index.0 .0 as usize] }
 }
-impl IndexMut<RegisterName> for Registers {
-    fn index_mut(&mut self, index: RegisterName) -> &mut Self::Output { &mut self.0[index as usize] }
+impl IndexMut<Register> for Registers {
+    fn index_mut(&mut self, index: Register) -> &mut Self::Output { &mut self.0[index.0 .0 as usize] }
 }
-use RegisterName as RN;
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy)]
-pub enum InterruptErr {
-    DivideByZero = 0,
-    BreakPoint,
-    InvalidInstruction,
-    StackUnderflow,
-    UnalignedAccess,
-    AccessViolation,
-    InterruptOverflow,
-}
-impl InterruptErr {
-    pub const fn try_from_u8(val: u8) -> Option<Self> {
-        match val {
-            0 => Some(Self::DivideByZero),
-            1 => Some(Self::BreakPoint),
-            2 => Some(Self::InvalidInstruction),
-            3 => Some(Self::StackUnderflow),
-            4 => Some(Self::UnalignedAccess),
-            5 => Some(Self::AccessViolation),
-            6 => Some(Self::InterruptOverflow),
-            _ => None,
-        }
-    }
-    /// # Panics
-    ///
-    /// panics if value is not a valid `InterruptErr`
-    pub const fn from_u8(val: u8) -> Self {
-        match val {
-            0 => Self::DivideByZero,
-            1 => Self::BreakPoint,
-            2 => Self::InvalidInstruction,
-            3 => Self::StackUnderflow,
-            4 => Self::UnalignedAccess,
-            5 => Self::AccessViolation,
-            6 => Self::InterruptOverflow,
-            _ => panic!(),
-        }
-    }
-}
+use Register as RN;
 
 #[allow(clippy::upper_case_acronyms)]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct CPU {
+pub(crate) struct CPU {
     registers: Registers,
     cycle:     u64,
     instr:     Instruction,
     running:   bool,
 }
 impl CPU {
-    pub const fn default() -> Self {
+    pub(crate) const fn default() -> Self {
         Self {
             registers: Registers([0; 16]),
             cycle:     0,
-            instr:     Instruction::zero(),
+            instr:     Instruction(0),
             running:   false,
         }
     }
     /// Same as `default()`, but running set to true
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             running: true,
             ..Self::default()
         }
     }
     const fn get_flag(&self, flag: StFlag) -> bool { self.registers.get_flag(flag) }
-    pub fn set_flag(&mut self, flag: StFlag, value: bool) { self.registers.set_flag(flag, value); }
+    pub(crate) fn set_flag(&mut self, flag: StFlag, value: bool) { self.registers.set_flag(flag, value); }
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn set_cmp(&mut self, equal: bool, less: bool, less_unsigned: bool, sign: bool, zero: bool) {
+        self.registers.set_cmp(equal, less, less_unsigned, sign, zero);
+    }
+    fn set_cmp_u64(&mut self, a: u64, b: u64) { self.set_cmp(a == b, (a as i64) < (b as i64), a < b, (a as i64) < 0, a == 0) }
+    fn set_cmp_f<F: Float>(&mut self, a: F, b: F) { self.set_cmp(a == b, a < b, a < b, a < F::ZERO, a.is_zero()) }
+    fn set_cmp_f_u64<F: Float>(&mut self, a: u64, b: u64)
+    where
+        u64: BitAccess<F::IntType>, {
+        self.set_cmp_f(F::from_bits_u64(a), F::from_bits_u64(b));
+    }
 }
 
 fn overflowing_add_unsigned(a: u64, b: u64, carry: bool) -> (u64, bool) {
@@ -486,37 +294,37 @@ fn overflowing_sub_signed(a: i64, b: i64, carry: bool) -> (i64, bool) {
 }
 
 #[derive(Debug, Clone)]
-pub struct Emulator {
+pub(crate) struct Emulator {
     cpu: CPU,
-    ic:  IC,
+    pub(crate) ic:  IC,
     mmu: MMU,
-    ioc: IOC,
+    pub(crate) ioc: IOC,
 
-    debug:       bool,
-    no_color:    bool,
+    // debug:       bool,
+    // no_color:    bool,
     cycle_limit: usize,
 }
 impl Emulator {
-    pub const fn new(cpu: CPU, ic: IC, mmu: MMU, debug: bool, cycle_limit: usize) -> Self {
+    pub(crate) const fn new(cpu: CPU, ic: IC, mmu: MMU, _debug: bool, cycle_limit: usize) -> Self {
         Self {
             cpu,
             ic,
             mmu,
             ioc: IOC::new(),
-            debug,
-            no_color: false,
+            // debug,
+            // no_color: false,
             cycle_limit,
         }
     }
-    const fn current_instr(&self) -> Instruction { self.cpu.registers.current_instr() }
+    fn current_instr(&self) -> Instruction { self.cpu.registers.current_instr() }
     fn set_current_instr(&mut self, instruction: Instruction) { self.cpu.registers.set_current_instr(instruction); }
 
     fn read_instruction(&self, addr: u64) -> Result<Instruction, mmu::Response> {
         let mut addr = addr;
-        if self.cpu.get_flag(StFlag::MODE) == ProcMode::User.bool() {
+        if self.cpu.get_flag(StFlag::MODE) == ProcMode::USER {
             addr = self.mmu.translate_address(addr, mmu::AccessMode::Execute)?;
         }
-        self.mmu.phys_get_u32(addr).map(Instruction::from_bits)
+        self.mmu.phys_get_u32(addr).map(Instruction)
     }
     fn read_u8(&self, addr: u64) -> Result<u8, mmu::Response> {
         let mut addr = addr;
@@ -545,6 +353,44 @@ impl Emulator {
             addr = self.mmu.translate_address(addr, mmu::AccessMode::Read)?;
         }
         self.mmu.phys_get_u64(addr)
+    }
+    fn read_to_u8(&mut self, addr: u64, to: Register) -> Result<(), mmu::Response> {
+        let v = self.read_u8(addr)?;
+        self.regval_mut(to).write(0, v);
+        Ok(())
+    }
+    fn read_to_u16(&mut self, addr: u64, to: Register) -> Result<(), mmu::Response> {
+        let v = self.read_u16(addr)?;
+        self.regval_mut(to).write(0, v);
+        Ok(())
+    }
+    fn read_to_u32(&mut self, addr: u64, to: Register) -> Result<(), mmu::Response> {
+        let v = self.read_u32(addr)?;
+        self.regval_mut(to).write(0, v);
+        Ok(())
+    }
+    fn read_to_u64(&mut self, addr: u64, to: Register) -> Result<(), mmu::Response> {
+        let v = self.read_u64(addr)?;
+        self.regval_mut(to).write(0, v);
+        Ok(())
+    }
+    fn read_to_u8_signed(&mut self, addr: u64, to: Register) -> Result<(), mmu::Response> {
+        let v = self.read_u8(addr)?;
+        self.regval_mut(to).write(0, v);
+        *self.regval_mut(to) = sign_extend!(self.regval(to), 8);
+        Ok(())
+    }
+    fn read_to_u16_signed(&mut self, addr: u64, to: Register) -> Result<(), mmu::Response> {
+        let v = self.read_u16(addr)?;
+        self.regval_mut(to).write(0, v);
+        *self.regval_mut(to) = sign_extend!(self.regval(to), 16);
+        Ok(())
+    }
+    fn read_to_u32_signed(&mut self, addr: u64, to: Register) -> Result<(), mmu::Response> {
+        let v = self.read_u32(addr)?;
+        self.regval_mut(to).write(0, v);
+        *self.regval_mut(to) = sign_extend!(self.regval(to), 32);
+        Ok(())
     }
     fn write_u8(&mut self, addr: u64, value: u8) -> Result<(), mmu::Response> {
         let mut addr = addr;
@@ -575,22 +421,22 @@ impl Emulator {
         self.mmu.phys_write_u64(addr, value)
     }
 
-    fn push_interrupt(&mut self, err: InterruptErr) {
+    fn push_interrupt(&mut self, err: Interrupt) {
         let mut err = err;
         if self.ic.queue.is_empty() {
-            self.ic.ret_addr = self.cpu.registers[RN::Ip];
-            self.ic.ret_status = self.cpu.registers[RN::St];
-            self.cpu.set_flag(StFlag::MODE, ProcMode::User.bool());
+            self.ic.ret_addr = self.cpu.registers[RN::IP];
+            self.ic.ret_status = self.cpu.registers[RN::ST];
+            self.cpu.set_flag(StFlag::MODE, ProcMode::USER);
         }
         if self.ic.queue.len() == self.ic.queue.capacity() {
             // interrupt queue overflow
             self.ic.queue.clear();
-            err = InterruptErr::InterruptOverflow;
+            err = Interrupt::InterruptOverflow;
         }
         // hijack instruction pointer
         match self
             .mmu
-            .phys_read_u64(self.ic.ivt_base_address + 8 * err as u64, &mut self.cpu.registers[RN::Ip])
+            .phys_read_u64(self.ic.ivt_base_address + 8 * err as u64, &mut self.cpu.registers[RN::IP])
         {
             Err(err) => {
                 self.push_interrupt_from_mmu(err);
@@ -600,7 +446,7 @@ impl Emulator {
             }
         }
     }
-    fn push_interrupt_from_mmu(&mut self, res: mmu::Response) { self.push_interrupt(res.to_interrupt_err()); }
+    fn push_interrupt_from_mmu(&mut self, res: mmu::Response) { self.push_interrupt(res.to_interrupt()); }
 
     fn return_interrupt(&mut self) {
         if self.ic.queue.is_empty() {
@@ -609,35 +455,35 @@ impl Emulator {
 
         let _ = self.ic.queue.remove(0);
         if self.ic.queue.is_empty() {
-            self.cpu.registers[RN::Ip] = self.ic.ret_addr;
-            self.cpu.registers[RN::St] = self.ic.ret_status;
+            self.cpu.registers[RN::IP] = self.ic.ret_addr;
+            self.cpu.registers[RN::ST] = self.ic.ret_status;
         } else {
             // hijack instruction pointer
             let code = self.ic.queue[self.ic.queue.len() - 1].code;
             match self.mmu.phys_get_u64(self.ic.ivt_base_address + 8 * code as u64) {
                 Err(err) => self.push_interrupt_from_mmu(err),
-                Ok(res) => self.cpu.registers[RN::Ip] = res,
+                Ok(res) => self.cpu.registers[RN::IP] = res,
             }
         }
     }
-    const fn regval(&self, reg: RegisterName) -> u64 { self.cpu.registers.0[reg as usize] }
-    const fn regval_n(&self, reg: usize) -> u64 { self.cpu.registers.0[reg] }
-    fn regval_mut(&mut self, reg: RegisterName) -> &mut u64 { &mut self.cpu.registers.0[reg as usize] }
-    fn regval_mut_n(&mut self, reg: usize) -> &mut u64 { &mut self.cpu.registers.0[reg] }
-    const fn proc_mode_is_user(&self) -> bool { self.cpu.get_flag(StFlag::MODE) == ProcMode::User.bool() }
-    const fn proc_mode_is_user_then_invalid(&self) -> Result<(), InvalidInstructionError> {
+    const fn regval(&self, reg: Register) -> u64 { self.cpu.registers.index(reg) }
+    fn regval_mut(&mut self, reg: Register) -> &mut u64 { &mut self.cpu.registers[reg] }
+    /// !!!!! Order is reverse compared to assignment statement !!!!!
+    fn regval_write(&mut self, from: Register, to: Register) { *self.regval_mut(to) = self.regval(from); }
+    const fn proc_mode_is_user(&self) -> bool { self.cpu.get_flag(StFlag::MODE) == ProcMode::USER }
+    const fn proc_mode_is_user_then_invalid(&self) -> Result<(), Interrupt> {
         if self.proc_mode_is_user() {
-            Err(InvalidInstructionError)
+            Err(Interrupt::InvalidInstruction)
         } else {
             Ok(())
         }
     }
     fn run_internal(&mut self) {
         self.cpu.cycle += 1;
-        println!("[at {:#016x} {:02x}]", self.regval(RN::Ip), self.current_instr().opcode());
+        println!("[at {:#016x} {:02x}]", self.regval(RN::IP), self.current_instr().opcode());
 
         // load instruction
-        match self.read_instruction(self.regval(RN::Ip)) {
+        match self.read_instruction(self.regval(RN::IP)) {
             Ok(instr) => self.set_current_instr(instr),
             Err(err) => {
                 self.push_interrupt_from_mmu(err);
@@ -645,665 +491,379 @@ impl Emulator {
             }
         }
 
-        *self.regval_mut(RN::Ip) += 4;
+        *self.regval_mut(RN::IP) += 4;
 
-        if let Err(InvalidInstructionError) = self.interpret_code() {
-            self.push_interrupt(InterruptErr::InvalidInstruction);
+        if let Err(err) = self.interpret_code() {
+            self.push_interrupt(err);
         }
 
         if self.ioc.out_pin {
-            self.ioc.dev_receive();
+            self.dev_receive();
         }
 
-        self.cpu.registers[RN::Rz] = 0;
+        self.cpu.registers[RN::RZ] = 0;
 
-        if self.regval(RN::Sp) > self.regval(RN::Fp) {
-            self.push_interrupt(InterruptErr::StackUnderflow);
+        if self.regval(RN::SP) > self.regval(RN::FP) {
+            self.push_interrupt(Interrupt::StackUnderflow);
         }
     }
 
+    pub(crate) fn dev_receive(&mut self) {
+        if let Some(port) = Ports::from_port(self.ioc.port) {
+            port.run(self, self.ioc.port_data(self.ioc.port));
+        }
+        self.ioc.out_pin = false;
+    }
     fn push_stack(&mut self, data: u64) {
-        *self.regval_mut(RN::Sp) -= 8;
-        if let Err(err) = self.write_u64(self.regval(RN::Sp), data) {
+        *self.regval_mut(RN::SP) -= 8;
+        if let Err(err) = self.write_u64(self.regval(RN::SP), data) {
             self.push_interrupt_from_mmu(err);
         }
     }
-    fn pop_stack(&mut self, value: &mut u64) {
-        match self.read_u64(self.regval(RN::Sp)) {
+    fn push_stack_from(&mut self, reg: Register) { self.push_stack(self.regval(reg)) }
+    fn pop_stack_to(&mut self, reg: Register) {
+        match self.read_u64(self.regval(RN::SP)) {
             Ok(val) => {
-                *self.regval_mut(RN::Sp) += 8;
-                *value = val;
-            }
-            Err(err) => self.push_interrupt_from_mmu(err),
-        }
-    }
-    fn pop_stack_to(&mut self, reg: RegisterName) {
-        match self.read_u64(self.regval(RN::Sp)) {
-            Ok(val) => {
-                *self.regval_mut(RN::Sp) += 8;
+                *self.regval_mut(RN::SP) += 8;
                 *self.regval_mut(reg) = val;
             }
             Err(err) => self.push_interrupt_from_mmu(err),
         }
     }
-    fn if_cond_then_do_that_weird_thang(&mut self, ci: Instruction, cond: bool) {
-        if cond {
-            *self.regval_mut(RN::Ip) += (4 * sign_extend!(ci.m().imm(), 20) as i64) as u64;
-        }
+    fn get_load_address(&self, rs: Register, off: u8, rn: Register, sh: Nibble) -> u64 {
+        // TODO: operator precedence?
+        self.regval(rs) + sign_extend!(off, 8) + (self.regval(rn) << (sh.0 as u64))
     }
-    fn interpret_code(&mut self) -> Result<(), InvalidInstructionError> {
+    // returned interrupt is ran through `push_interrupt`
+    #[allow(clippy::too_many_lines)]
+    fn interpret_code(&mut self) -> Result<(), Interrupt> {
         let ci = self.current_instr();
-        match ci.opcode() {
-            // System control
-            0x01 => match ci.f().func() {
-                // int
-                0x00 => self.push_interrupt(InterruptErr::from_u8(ci.f().imm() as u8)),
-                // iret | ires
-                0x01 | 0x02 => {
-                    self.proc_mode_is_user_then_invalid()?;
-                    self.return_interrupt();
-                }
-                // usr
-                0x03 => {
-                    self.proc_mode_is_user_then_invalid()?;
-                    self.cpu.set_flag(StFlag::MODE, ProcMode::User.bool());
-                    self.cpu.registers[RN::Ip] = self.regval_n(get_usize!(ci.f.rde));
-                }
-                _ => Err(InvalidInstructionError)?,
-            },
-            // outr
-            0x02 => {
+        let opcode = Opcode::from_instruction(self.current_instr())?;
+        match opcode {
+            Opcode::Int { imm } => Err(imm)?,
+            opcode @ (Opcode::Iret | Opcode::Ires | Opcode::Usr { .. }) => {
                 self.proc_mode_is_user_then_invalid()?;
-                self.ioc
-                    .send_out(self.regval_n(get_usize!(ci.m.rde)) as u16, self.regval_n(get_usize!(ci.m.rs1)));
+                match opcode {
+                    Opcode::Iret | Opcode::Ires => self.return_interrupt(),
+                    Opcode::Usr { rd } => {
+                        self.cpu.set_flag(StFlag::MODE, ProcMode::USER);
+                        self.cpu.registers[RN::IP] = self.regval(rd);
+                    }
+                    _ => unreachable!(),
+                }
             }
-            // outi
-            0x03 => {
+            opcode @ (Opcode::Outr { .. } | Opcode::Outi { .. } | Opcode::Inr { .. } | Opcode::Ini { .. }) => {
                 self.proc_mode_is_user_then_invalid()?;
-                self.ioc.send_out(ci.m().imm() as u16, self.regval_n(get_usize!(ci.m.rs1)));
+                match opcode {
+                    Opcode::Outr { rd, rs } => self.ioc.send_out(self.regval(rd).into(), self.regval(rs)),
+                    Opcode::Outi { imm, rs } => self.ioc.send_out(imm, self.regval(rs)),
+                    Opcode::Inr { rd, rs } => *self.regval_mut(rd) = self.ioc.port_data(self.regval(rs).into()),
+                    Opcode::Ini { rd, imm } => *self.regval_mut(rd) = self.ioc.port_data(imm),
+                    _ => unreachable!(),
+                }
             }
-            // inr
-            0x04 => {
-                self.proc_mode_is_user_then_invalid()?;
-                *self.regval_mut_n(get_usize!(ci.m.rde)) = self.ioc.port_data(self.regval_n(get_usize!(ci.m.rs1)) as u16);
+            Opcode::Jal { rs, imm } => {
+                self.push_stack_from(RN::IP);
+                *self.regval_mut(RN::IP) = self.regval(rs) + (sign_extend!(imm, 16) as i64 * 4) as u64;
             }
-            // ini
-            0x05 => {
-                self.proc_mode_is_user_then_invalid()?;
-                *self.regval_mut_n(get_usize!(ci.m.rde)) = self.ioc.port_data(ci.m().imm() as u16);
+            Opcode::Jalr { rd, rs, imm } => {
+                *self.regval_mut(rd) = self.regval(RN::IP);
+                *self.regval_mut(RN::IP) = self.regval(rs) + (sign_extend!(imm, 16) as i64 * 4) as u64;
             }
-            // jal
-            0x06 => {
-                self.push_stack(self.regval(RN::Ip));
-                *self.regval_mut(RN::Ip) = self.regval_n(get_usize!(ci.m.rs1)) + (4 * sign_extend!(ci.m().imm(), 16) as i64) as u64;
+            Opcode::Ret => self.pop_stack_to(RN::IP),
+            Opcode::Retr { rs } => self.regval_write(rs, RN::IP),
+            Opcode::B { cc, imm } => {
+                if cc.cond(|flag| self.cpu.get_flag(flag)) {
+                    *self.regval_mut(RN::IP) += (sign_extend!(imm, 20) as i64 * 4) as u64;
+                }
             }
-            // jalr
-            0x07 => {
-                *self.regval_mut_n(ci.m().rde() as usize) = self.regval(RN::Ip);
-                *self.regval_mut(RN::Ip) = self.regval_n(get_usize!(ci.m.rs1)) + (4 * sign_extend!(ci.m().imm(), 16) as i64) as u64;
+            Opcode::Push { rs } => self.push_stack_from(rs),
+            Opcode::Pop { rd } => self.pop_stack_to(rd),
+            Opcode::Enter => {
+                self.push_stack_from(RN::FP);
+                self.regval_write(RN::SP, RN::FP);
             }
-            // ret
-            0x08 => {
-                self.pop_stack_to(RN::Ip);
+            Opcode::Leave => {
+                self.regval_write(RN::FP, RN::SP);
+                self.pop_stack_to(RN::FP);
             }
-            // retr
-            0x09 => {
-                *self.regval_mut(RN::Ip) = self.regval_n(get_usize!(ci.m.rs1));
-            }
-            // branch instructions
-            0x0a => match ci.b().imm() {
-                // bra
-                0x0 => {
-                    self.if_cond_then_do_that_weird_thang(ci, true);
-                }
-                // beq
-                0x1 => {
-                    self.if_cond_then_do_that_weird_thang(ci, self.cpu.get_flag(StFlag::EQUAL));
-                }
-                // bez
-                0x2 => {
-                    self.if_cond_then_do_that_weird_thang(ci, self.cpu.get_flag(StFlag::ZERO));
-                }
-                // blt
-                0x3 => {
-                    self.if_cond_then_do_that_weird_thang(ci, self.cpu.get_flag(StFlag::LESS));
-                }
-                // ble
-                0x4 => {
-                    self.if_cond_then_do_that_weird_thang(ci, self.cpu.get_flag(StFlag::LESS) || self.cpu.get_flag(StFlag::EQUAL));
-                }
-                // bltu
-                0x5 => {
-                    self.if_cond_then_do_that_weird_thang(ci, self.cpu.get_flag(StFlag::LESS_UNSIGNED));
-                }
-                // bleu
-                0x6 => {
-                    self.if_cond_then_do_that_weird_thang(ci, self.cpu.get_flag(StFlag::LESS_UNSIGNED) || self.cpu.get_flag(StFlag::EQUAL));
-                }
-                // bne
-                0x9 => {
-                    self.if_cond_then_do_that_weird_thang(ci, !self.cpu.get_flag(StFlag::EQUAL));
-                }
-                // bnz
-                0xa => {
-                    self.if_cond_then_do_that_weird_thang(ci, !self.cpu.get_flag(StFlag::ZERO));
-                }
-                // bge
-                0xb => {
-                    self.if_cond_then_do_that_weird_thang(ci, !self.cpu.get_flag(StFlag::LESS));
-                }
-                // bgt
-                0xc => {
-                    self.if_cond_then_do_that_weird_thang(ci, !self.cpu.get_flag(StFlag::LESS) && !self.cpu.get_flag(StFlag::EQUAL));
-                }
-                // bgeu
-                0xd => {
-                    self.if_cond_then_do_that_weird_thang(ci, !self.cpu.get_flag(StFlag::LESS_UNSIGNED));
-                }
-                // bteu
-                0xe => {
-                    self.if_cond_then_do_that_weird_thang(ci, !self.cpu.get_flag(StFlag::LESS_UNSIGNED) && !self.cpu.get_flag(StFlag::EQUAL));
-                }
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Li { rd, func, imm } => match func {
+                LiType::Lli => self.regval_mut(rd).write(0, imm),
+                LiType::Llis => *self.regval_mut(rd) = sign_extend!(imm, 16),
+                LiType::Lui => self.regval_mut(rd).write(1, imm),
+                LiType::Luis => *self.regval_mut(rd) = sign_extend!(imm, 16) << 16,
+                LiType::Lti => self.regval_mut(rd).write(2, imm),
+                LiType::Ltis => *self.regval_mut(rd) = sign_extend!(imm, 16) << 32,
+                LiType::Ltui => self.regval_mut(rd).write(3, imm),
+                LiType::Ltuis => *self.regval_mut(rd) = sign_extend!(imm, 16) << 48,
             },
-            // push
-            0x0b => {
-                self.push_stack(self.regval_n(get_usize!(ci.m.rs1)));
-            }
-            // pop
-            0x0c => {
-                self.pop_stack_to(RN::from_u8(ci.m().rde() as u8));
-            }
-            // enter
-            0x0d => {
-                self.push_stack(self.regval(RN::Fp));
-                *self.regval_mut(RN::Fp) = self.regval(RN::Sp);
-            }
-            // leave
-            0x0e => {
-                *self.regval_mut(RN::Sp) = self.regval(RN::Fp);
-                self.pop_stack_to(RN::Fp);
-            }
-            // load immediate
-            0x10 => match ci.f().func() {
-                // lli
-                0 => unsafe_write(self.regval_mut_n(get_usize!(ci.f.rde)), ci.f().imm() as u16, 0),
-                // llis
-                1 => *self.regval_mut_n(get_usize!(ci.f.rde)) = sign_extend!(ci.f().imm(), 16),
-                // lui
-                2 => unsafe_write(self.regval_mut_n(get_usize!(ci.f.rde)), ci.f().imm() as u16, 1),
-                // luis
-                3 => *self.regval_mut_n(get_usize!(ci.f.rde)) = sign_extend!(ci.f().imm(), 16) << 16,
-                // lti
-                4 => unsafe_write(self.regval_mut_n(get_usize!(ci.f.rde)), ci.f().imm() as u16, 2),
-                // ltis
-                5 => *self.regval_mut_n(get_usize!(ci.f.rde)) = sign_extend!(ci.f().imm(), 16) << 32,
-                // ltui
-                6 => unsafe_write(self.regval_mut_n(get_usize!(ci.f.rde)), ci.f().imm() as u16, 3),
-                // ltuis
-                7 => *self.regval_mut_n(get_usize!(ci.f.rde)) = sign_extend!(ci.f().imm(), 16) << 48,
-                _ => Err(InvalidInstructionError)?,
-            },
-            // lw
-            0x11 => match self.read_u64(
-                self.regval_n(get_usize!(ci.e.rs1)) + sign_extend!(ci.e().imm(), 8) + ((self.regval_n(get_usize!(ci.e.rs1))) << ci.e().func() as u64),
-            ) {
-                Ok(val) => *self.regval_mut_n(get_usize!(ci.e.rde)) = val,
-                Err(err) => self.push_interrupt_from_mmu(err),
-            },
-            // lh
-            0x12 => match self.read_u32(
-                self.regval_n(get_usize!(ci.e.rs1)) + sign_extend!(ci.e().imm(), 8) + ((self.regval_n(get_usize!(ci.e.rs1))) << ci.e().func() as u64),
-            ) {
-                Ok(val) => unsafe_write(self.regval_mut_n(get_usize!(ci.e.rde)), val, 0),
-                Err(err) => self.push_interrupt_from_mmu(err),
-            },
-            // lhs
-            0x13 => {
-                match self.read_u32(
-                    self.regval_n(get_usize!(ci.e.rs1))
-                        + sign_extend!(ci.e().imm(), 8)
-                        + ((self.regval_n(get_usize!(ci.e.rs1))) << ci.e().func() as u64),
-                ) {
-                    Ok(val) => unsafe_write(self.regval_mut_n(get_usize!(ci.e.rde)), val, 0),
-                    Err(err) => self.push_interrupt_from_mmu(err),
-                }
-                *self.regval_mut_n(get_usize!(ci.e.rde)) = sign_extend!(self.regval_n(get_usize!(ci.e.rde)), 32);
-            }
-            // lq
-            0x14 => match self.read_u16(
-                self.regval_n(get_usize!(ci.e.rs1)) + sign_extend!(ci.e().imm(), 8) + ((self.regval_n(get_usize!(ci.e.rs1))) << ci.e().func() as u64),
-            ) {
-                Ok(val) => unsafe_write(self.regval_mut_n(get_usize!(ci.e.rde)), val, 0),
-                Err(err) => self.push_interrupt_from_mmu(err),
-            },
-            // lqs
-            0x15 => {
-                match self.read_u16(
-                    self.regval_n(get_usize!(ci.e.rs1))
-                        + sign_extend!(ci.e().imm(), 8)
-                        + ((self.regval_n(get_usize!(ci.e.rs1))) << ci.e().func() as u64),
-                ) {
-                    Ok(val) => unsafe_write(self.regval_mut_n(get_usize!(ci.e.rde)), val, 0),
-                    Err(err) => self.push_interrupt_from_mmu(err),
-                }
-                *self.regval_mut_n(get_usize!(ci.e.rde)) = sign_extend!(self.regval_n(get_usize!(ci.e.rde)), 32);
-            }
-            // lb
-            0x16 => {
-                match self.read_u8(
-                    self.regval_n(get_usize!(ci.e.rs1))
-                        + sign_extend!(ci.e().imm(), 8)
-                        + ((self.regval_n(get_usize!(ci.e.rs1))) << ci.e().func() as u64),
-                ) {
-                    Ok(val) => unsafe_write(self.regval_mut_n(get_usize!(ci.e.rde)), val, 0),
-                    Err(err) => self.push_interrupt_from_mmu(err),
-                }
-            }
-            // lbs
-            0x17 => {
-                match self.read_u8(
-                    self.regval_n(get_usize!(ci.e.rs1))
-                        + sign_extend!(ci.e().imm(), 8)
-                        + ((self.regval_n(get_usize!(ci.e.rs1))) << ci.e().func() as u64),
-                ) {
-                    Ok(val) => unsafe_write(self.regval_mut_n(get_usize!(ci.e.rde)), val, 0),
-                    Err(err) => self.push_interrupt_from_mmu(err),
-                }
-                *self.regval_mut_n(get_usize!(ci.e.rde)) = sign_extend!(self.regval_n(get_usize!(ci.e.rde)), 32);
-            }
-            // sw
-            0x18 => {
-                if let Err(err) = self.write_u64(
-                    self.regval_n(get_usize!(ci.e.rs1))
-                        + sign_extend!(ci.e().imm(), 8)
-                        + ((self.regval_n(get_usize!(ci.e.rs1))) << ci.e().func() as u64),
-                    self.regval_n(get_usize!(ci.e.rde)),
-                ) {
+            opcode @ (Opcode::Lw { rd, rs, rn, sh, off }
+            | Opcode::Lh { rd, rs, rn, sh, off }
+            | Opcode::Lhs { rd, rs, rn, sh, off }
+            | Opcode::Lq { rd, rs, rn, sh, off }
+            | Opcode::Lqs { rd, rs, rn, sh, off }
+            | Opcode::Lb { rd, rs, rn, sh, off }
+            | Opcode::Lbs { rd, rs, rn, sh, off }) => {
+                let addr = self.get_load_address(rs, off, rn, sh);
+                if let Err(err) = match opcode {
+                    Opcode::Lw { .. } => self.read_to_u64(addr, rd),
+                    Opcode::Lh { .. } => self.read_to_u32(addr, rd),
+                    Opcode::Lhs { .. } => self.read_to_u32_signed(addr, rd),
+                    Opcode::Lq { .. } => self.read_to_u16(addr, rd),
+                    Opcode::Lqs { .. } => self.read_to_u16_signed(addr, rd),
+                    Opcode::Lb { .. } => self.read_to_u8(addr, rd),
+                    Opcode::Lbs { .. } => self.read_to_u8_signed(addr, rd),
+                    _ => unreachable!(),
+                } {
                     self.push_interrupt_from_mmu(err);
                 }
             }
-            // sh
-            0x19 => {
-                if let Err(err) = self.write_u32(
-                    self.regval_n(get_usize!(ci.e.rs1))
-                        + sign_extend!(ci.e().imm(), 8)
-                        + ((self.regval_n(get_usize!(ci.e.rs1))) << ci.e().func() as u64),
-                    self.regval_n(get_usize!(ci.e.rde)) as u32,
-                ) {
+            opcode @ (Opcode::Sw { rd, rs, rn, sh, off }
+            | Opcode::Sh { rd, rs, rn, sh, off }
+            | Opcode::Sq { rd, rs, rn, sh, off }
+            | Opcode::Sb { rd, rs, rn, sh, off }) => {
+                let addr = self.get_load_address(rs, off, rn, sh);
+                if let Err(err) = match opcode {
+                    Opcode::Sw { .. } => self.write_u64(addr, self.regval(rd)),
+                    Opcode::Sh { .. } => self.write_u32(addr, self.regval(rd) as u32),
+                    Opcode::Sq { .. } => self.write_u16(addr, self.regval(rd) as u16),
+                    Opcode::Sb { .. } => self.write_u8(addr, self.regval(rd) as u8),
+                    _ => unreachable!(),
+                } {
                     self.push_interrupt_from_mmu(err);
                 }
             }
-            // sq
-            0x1a => {
-                if let Err(err) = self.write_u16(
-                    self.regval_n(get_usize!(ci.e.rs1))
-                        + sign_extend!(ci.e().imm(), 8)
-                        + ((self.regval_n(get_usize!(ci.e.rs1))) << ci.e().func() as u64),
-                    self.regval_n(get_usize!(ci.e.rde)) as u16,
-                ) {
-                    self.push_interrupt_from_mmu(err);
-                }
-            }
-            // sb
-            0x1b => {
-                if let Err(err) = self.write_u8(
-                    self.regval_n(get_usize!(ci.e.rs1))
-                        + sign_extend!(ci.e().imm(), 8)
-                        + ((self.regval_n(get_usize!(ci.e.rs1))) << ci.e().func() as u64),
-                    self.regval_n(get_usize!(ci.e.rde)) as u8,
-                ) {
-                    self.push_interrupt_from_mmu(err);
-                }
-            }
-            // cmpr
-            0x1e => {
-                let a = self.regval_n(get_usize!(ci.m.rde));
-                let b = self.regval_n(get_usize!(ci.m.rs1));
-                self.cmp(a, b);
-            }
-            // cmpi
-            0x1f => {
-                let (a, b) = if ci.f().func() == 0 {
-                    (self.regval_n(get_usize!(ci.f.rde)), sign_extend!(ci.f().imm(), 16))
-                } else if ci.f().func() == 1 {
-                    (sign_extend!(ci.f().imm(), 16), self.regval_n(get_usize!(ci.f.rde)))
+            Opcode::Cmpr { r1, r2 } => self.cpu.set_cmp_u64(self.regval(r1), self.regval(r2)),
+            Opcode::Cmpi { r1, s, imm } => {
+                let (a, b) = if s {
+                    (sign_extend!(imm, 16), self.regval(r1))
                 } else {
-                    return Err(InvalidInstructionError);
+                    (self.regval(r1), sign_extend!(imm, 16))
                 };
-                self.cmp(a, b);
+                self.cpu.set_cmp_u64(a, b);
             }
-            // addr
-            0x20 => arithmetic!(self, ci, add, r),
-            // addi
-            0x21 => arithmetic!(self, ci, add, i),
-            // subr
-            0x22 => arithmetic!(self, ci, sub, r),
-            // subi
-            0x23 => arithmetic!(self, ci, sub, i),
-            // imulr
-            0x24 => arithmetic!(self, ci, imul, r),
-            // imuli
-            0x25 => arithmetic!(self, ci, imul, i),
-            // idivr
-            0x26 => arithmetic!(self, ci, idiv, r),
-            // idivi
-            0x27 => {
-                if self.regval_n(get_usize!(ci.e.rs2)) == 0 {
-                    self.push_interrupt(InterruptErr::DivideByZero);
-                } else {
-                    arithmetic!(self, ci, idiv, i);
+
+            Opcode::Addr { rd, r1, r2 } => arithmetic!(self.add(*r1, *r2) -> rd),
+            Opcode::Addi { rd, r1, imm } => arithmetic!(self.add(*r1, imm) -> rd),
+            Opcode::Subr { rd, r1, r2 } => arithmetic!(self.sub(*r1, *r2) -> rd),
+            Opcode::Subi { rd, r1, imm } => arithmetic!(self.sub(*r1, imm) -> rd),
+            Opcode::Imulr { rd, r1, r2 } => arithmetic!(self.imul(*r1, *r2) -> rd),
+            Opcode::Imuli { rd, r1, imm } => arithmetic!(self.imul(*r1, imm) -> rd),
+            Opcode::Idivr { rd, r1, r2 } => arithmetic!(self.idiv(*r1, *r2) -> rd),
+            Opcode::Idivi { rd, r1, imm } => {
+                if self.regval(Register(ci.nth_nibble(5))) == 0 {
+                    Err(Interrupt::DivideByZero)?;
                 }
+                arithmetic!(self.idiv(*r1, imm) -> rd);
             }
-            // umulr
-            0x28 => arithmetic!(self, ci, umul, r),
-            // umuli
-            0x29 => arithmetic!(self, ci, umul, i),
-            // udivr
-            0x2a => arithmetic!(self, ci, udiv, r),
-            // udivi
-            0x2b => arithmetic!(self, ci, udiv, i),
-            // remr
-            0x2c => arithmetic!(self, ci, rem, r),
-            // remi
-            0x2d => arithmetic!(self, ci, rem, i),
-            // modr
-            0x2e => arithmetic!(self, ci, r#mod, r),
-            // modi
-            0x2f => arithmetic!(self, ci, r#mod, i),
+            Opcode::Umulr { rd, r1, r2 } => arithmetic!(self.umul(*r1, *r2) -> rd),
+            Opcode::Umuli { rd, r1, imm } => arithmetic!(self.umul(*r1, imm) -> rd),
+            Opcode::Udivr { rd, r1, r2 } => arithmetic!(self.udiv(*r1, *r2) -> rd),
+            Opcode::Udivi { rd, r1, imm } => arithmetic!(self.udiv(*r1, imm) -> rd),
+            Opcode::Remr { rd, r1, r2 } => arithmetic!(self.rem(*r1, *r2) -> rd),
+            Opcode::Remi { rd, r1, imm } => arithmetic!(self.rem(*r1, imm) -> rd),
+            Opcode::Modr { rd, r1, r2 } => arithmetic!(self.r#mod(*r1, *r2) -> rd),
+            Opcode::Modi { rd, r1, imm } => arithmetic!(self.r#mod(*r1, imm) -> rd),
 
-            // andr
-            0x30 => bitwise!(self, ci, and, r),
-            // andi
-            0x31 => bitwise!(self, ci, and, i),
-            // orr
-            0x32 => bitwise!(self, ci, or, r),
-            // ori
-            0x33 => bitwise!(self, ci, or, i),
-            // norr
-            0x34 => bitwise!(self, ci, nor, r),
-            // nori
-            0x35 => bitwise!(self, ci, nor, i),
-            // xorr
-            0x36 => bitwise!(self, ci, xor, r),
-            // xori
-            0x37 => bitwise!(self, ci, xor, i),
-            // shlr
-            0x38 => bitwise!(self, ci, shl, r),
-            // shli
-            0x39 => bitwise!(self, ci, shl, i),
-            // asrr
-            0x3a => bitwise!(self, ci, sar, r),
-            // asri
-            0x3b => bitwise!(self, ci, sar, i),
-            // lsrr
-            0x3c => bitwise!(self, ci, shr, r),
-            // lsri
-            0x3d => bitwise!(self, ci, shr, i),
-            // bitr
-            0x3e => bitwise!(self, ci, bit, r),
-            // biti
-            0x3f => bitwise!(self, ci, bit, i),
+            Opcode::Andr { rd, r1, r2 } => bitwise!(self.and(*r1, *r2) -> rd),
+            Opcode::Andi { rd, r1, imm } => bitwise!(self.and(*r1, imm) -> rd),
+            Opcode::Orr { rd, r1, r2 } => bitwise!(self.or(*r1, *r2) -> rd),
+            Opcode::Ori { rd, r1, imm } => bitwise!(self.or(*r1, imm) -> rd),
+            Opcode::Norr { rd, r1, r2 } => bitwise!(self.nor(*r1, *r2) -> rd),
+            Opcode::Nori { rd, r1, imm } => bitwise!(self.nor(*r1, imm) -> rd),
+            Opcode::Xorr { rd, r1, r2 } => bitwise!(self.xor(*r1, *r2) -> rd),
+            Opcode::Xori { rd, r1, imm } => bitwise!(self.xor(*r1, imm) -> rd),
+            Opcode::Shlr { rd, r1, r2 } => bitwise!(self.shl(*r1, *r2) -> rd),
+            Opcode::Shli { rd, r1, imm } => bitwise!(self.shl(*r1, imm) -> rd),
+            Opcode::Asrr { rd, r1, r2 } => bitwise!(self.sar(*r1, *r2) -> rd),
+            Opcode::Asri { rd, r1, imm } => bitwise!(self.sar(*r1, imm) -> rd),
+            Opcode::Lsrr { rd, r1, r2 } => bitwise!(self.shr(*r1, *r2) -> rd),
+            Opcode::Lsri { rd, r1, imm } => bitwise!(self.shr(*r1, imm) -> rd),
+            Opcode::Bitr { rd, r1, r2 } => bitwise!(self.bit(*r1, *r2) -> rd),
+            Opcode::Biti { rd, r1, imm } => bitwise!(self.bit(*r1, imm) -> rd),
 
-            /* Extension F- Floating-Point Operations */
-            0x40 => match ci.e().func() {
-                0 => self.fcomp::<f16>(ci),
-                1 => self.fcomp::<f32>(ci),
-                2 => self.fcomp::<f64>(ci),
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Fcmp { r1, r2, p } => match p {
+                FloatPrecision::F16 => self.fcmp::<f16>(r1, r2),
+                FloatPrecision::F32 => self.fcmp::<f32>(r1, r2),
+                FloatPrecision::F64 => self.fcmp::<f64>(r1, r2),
             },
-            // fto
-            0x41 => match ci.e().func() {
-                0 => self.fto::<f16>(ci),
-                1 => self.fto::<f32>(ci),
-                2 => self.fto::<f64>(ci),
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Fto { rd, rs, p } => match p {
+                FloatPrecision::F16 => self.fto::<f16>(rd, rs),
+                FloatPrecision::F32 => self.fto::<f32>(rd, rs),
+                FloatPrecision::F64 => self.fto::<f64>(rd, rs),
             },
-            // ffrom
-            0x42 => match ci.e().func() {
-                0 => self.ffrom::<f16>(ci),
-                1 => self.ffrom::<f32>(ci),
-                2 => self.ffrom::<f64>(ci),
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Ffrom { rd, rs, p } => match p {
+                FloatPrecision::F16 => self.ffrom::<f16>(rd, rs),
+                FloatPrecision::F32 => self.ffrom::<f32>(rd, rs),
+                FloatPrecision::F64 => self.ffrom::<f64>(rd, rs),
             },
-            // fneg
-            0x43 => match ci.e().func() {
-                0 => self.fneg::<f16>(ci),
-                1 => self.fneg::<f32>(ci),
-                2 => self.fneg::<f64>(ci),
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Fneg { rd, rs, p } => match p {
+                FloatPrecision::F16 => self.fmonadic::<f16>(rd, rs, Neg::neg),
+                FloatPrecision::F32 => self.fmonadic::<f32>(rd, rs, Neg::neg),
+                FloatPrecision::F64 => self.fmonadic::<f64>(rd, rs, Neg::neg),
             },
-            // fabs
-            0x44 => match ci.e().func() {
-                0 => self.fabs::<f16>(ci),
-                1 => self.fabs::<f32>(ci),
-                2 => self.fabs::<f64>(ci),
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Fabs { rd, rs, p } => match p {
+                FloatPrecision::F16 => self.fmonadic::<f16>(rd, rs, Float::abs),
+                FloatPrecision::F32 => self.fmonadic::<f32>(rd, rs, Float::abs),
+                FloatPrecision::F64 => self.fmonadic::<f64>(rd, rs, Float::abs),
             },
-            // fadd
-            0x45 => match ci.e().func() {
-                0 => self.fadd::<f16>(ci),
-                1 => self.fadd::<f32>(ci),
-                2 => self.fadd::<f64>(ci),
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Fadd { rd, r1, r2, p } => match p {
+                FloatPrecision::F16 => self.fdyadic::<f16>(rd, r1, r2, Add::add),
+                FloatPrecision::F32 => self.fdyadic::<f32>(rd, r1, r2, Add::add),
+                FloatPrecision::F64 => self.fdyadic::<f64>(rd, r1, r2, Add::add),
             },
-            // fsub
-            0x46 => match ci.e().func() {
-                0 => self.fsub::<f16>(ci),
-                1 => self.fsub::<f32>(ci),
-                2 => self.fsub::<f64>(ci),
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Fsub { rd, r1, r2, p } => match p {
+                FloatPrecision::F16 => self.fdyadic::<f16>(rd, r1, r2, Sub::sub),
+                FloatPrecision::F32 => self.fdyadic::<f32>(rd, r1, r2, Sub::sub),
+                FloatPrecision::F64 => self.fdyadic::<f64>(rd, r1, r2, Sub::sub),
             },
-            // fmul
-            0x47 => match ci.e().func() {
-                0 => self.fmul::<f16>(ci),
-                1 => self.fmul::<f32>(ci),
-                2 => self.fmul::<f64>(ci),
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Fmul { rd, r1, r2, p } => match p {
+                FloatPrecision::F16 => self.fdyadic::<f16>(rd, r1, r2, Mul::mul),
+                FloatPrecision::F32 => self.fdyadic::<f32>(rd, r1, r2, Mul::mul),
+                FloatPrecision::F64 => self.fdyadic::<f64>(rd, r1, r2, Mul::mul),
             },
-            // fdiv
-            0x48 => match ci.e().func() {
-                0 => self.fdiv::<f16>(ci),
-                1 => self.fdiv::<f32>(ci),
-                2 => self.fdiv::<f64>(ci),
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Fdiv { rd, r1, r2, p } => match p {
+                FloatPrecision::F16 => self.fdyadic::<f16>(rd, r1, r2, Div::div),
+                FloatPrecision::F32 => self.fdyadic::<f32>(rd, r1, r2, Div::div),
+                FloatPrecision::F64 => self.fdyadic::<f64>(rd, r1, r2, Div::div),
             },
-            // fma
-            0x49 => match ci.e().func() {
-                0 => self.fma::<f16>(ci),
-                1 => self.fma::<f32>(ci),
-                2 => self.fma::<f64>(ci),
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Fma { rd, r1, r2, p } => match p {
+                FloatPrecision::F16 => self.fma::<f16>(rd, r1, r2),
+                FloatPrecision::F32 => self.fma::<f32>(rd, r1, r2),
+                FloatPrecision::F64 => self.fma::<f64>(rd, r1, r2),
             },
-            // fsqrt
-            0x4a => match ci.e().func() {
-                0 => self.fsqrt::<f16>(ci),
-                1 => self.fsqrt::<f32>(ci),
-                2 => self.fsqrt::<f64>(ci),
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Fsqrt { rd, r1, p } => match p {
+                FloatPrecision::F16 => self.fmonadic::<f16>(rd, r1, Float::sqrt),
+                FloatPrecision::F32 => self.fmonadic::<f32>(rd, r1, Float::sqrt),
+                FloatPrecision::F64 => self.fmonadic::<f64>(rd, r1, Float::sqrt),
             },
-            // fmin
-            0x4b => match ci.e().func() {
-                0 => self.fmin::<f16>(ci),
-                1 => self.fmin::<f32>(ci),
-                2 => self.fmin::<f64>(ci),
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Fmin { rd, r1, r2, p } => match p {
+                FloatPrecision::F16 => self.fdyadic::<f16>(rd, r1, r2, Float::min),
+                FloatPrecision::F32 => self.fdyadic::<f32>(rd, r1, r2, Float::min),
+                FloatPrecision::F64 => self.fdyadic::<f64>(rd, r1, r2, Float::min),
             },
-            // fmax
-            0x4c => match ci.e().func() {
-                0 => self.fmax::<f16>(ci),
-                1 => self.fmax::<f32>(ci),
-                2 => self.fmax::<f64>(ci),
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Fmax { rd, r1, r2, p } => match p {
+                FloatPrecision::F16 => self.fdyadic::<f16>(rd, r1, r2, Float::max),
+                FloatPrecision::F32 => self.fdyadic::<f32>(rd, r1, r2, Float::max),
+                FloatPrecision::F64 => self.fdyadic::<f64>(rd, r1, r2, Float::max),
             },
-            // fsat
-            0x4d => match ci.e().func() {
-                0 => self.fsat::<f16>(ci),
-                1 => self.fsat::<f32>(ci),
-                2 => self.fsat::<f64>(ci),
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Fsat { rd, r1, p } => match p {
+                FloatPrecision::F16 => self.fmonadic::<f16>(rd, r1, Float::ceil),
+                FloatPrecision::F32 => self.fmonadic::<f32>(rd, r1, Float::ceil),
+                FloatPrecision::F64 => self.fmonadic::<f64>(rd, r1, Float::ceil),
             },
-            // fcnv
-            0x4e => match ci.e().func() {
-                0b_00_00 => self.fconvert::<f16, f16>(ci),
-                0b_00_01 => self.fconvert::<f16, f32>(ci),
-                0b_00_10 => self.fconvert::<f16, f64>(ci),
-                0b_01_00 => self.fconvert::<f32, f16>(ci),
-                0b_01_01 => self.fconvert::<f32, f32>(ci),
-                0b_01_10 => self.fconvert::<f32, f64>(ci),
-                0b_10_00 => self.fconvert::<f64, f16>(ci),
-                0b_10_01 => self.fconvert::<f64, f32>(ci),
-                0b_10_10 => self.fconvert::<f64, f64>(ci),
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Fcnv {
+                rd,
+                r1,
+                p: FloatCastType { to, from },
+            } => match (to, from) {
+                (FloatPrecision::F16, FloatPrecision::F16) => self.fcnv::<f16, f16>(rd, r1),
+                (FloatPrecision::F16, FloatPrecision::F32) => self.fcnv::<f16, f32>(rd, r1),
+                (FloatPrecision::F16, FloatPrecision::F64) => self.fcnv::<f16, f64>(rd, r1),
+                (FloatPrecision::F32, FloatPrecision::F16) => self.fcnv::<f32, f16>(rd, r1),
+                (FloatPrecision::F32, FloatPrecision::F32) => self.fcnv::<f32, f32>(rd, r1),
+                (FloatPrecision::F32, FloatPrecision::F64) => self.fcnv::<f32, f64>(rd, r1),
+                (FloatPrecision::F64, FloatPrecision::F16) => self.fcnv::<f64, f16>(rd, r1),
+                (FloatPrecision::F64, FloatPrecision::F32) => self.fcnv::<f64, f32>(rd, r1),
+                (FloatPrecision::F64, FloatPrecision::F64) => self.fcnv::<f64, f64>(rd, r1),
             },
-            // fnan
-            0x4f => match ci.e().func() {
-                0 => self.fnan::<f16>(ci),
-                1 => self.fnan::<f32>(ci),
-                2 => self.fnan::<f64>(ci),
-                _ => Err(InvalidInstructionError)?,
+            Opcode::Fnan { rd, r1, p } => match p {
+                FloatPrecision::F16 => self.fnan::<f16>(rd, r1),
+                FloatPrecision::F32 => self.fnan::<f32>(rd, r1),
+                FloatPrecision::F64 => self.fnan::<f64>(rd, r1),
             },
-            _ => Err(InvalidInstructionError)?,
         }
         Ok(())
     }
-    fn cmp(&mut self, a: u64, b: u64) {
-        make_comp!(self, a, b);
+
+    fn fcmp<F: Float>(&mut self, r1: Register, r2: Register)
+    where
+        u64: BitAccess<F::IntType>, {
+        self.cpu.set_cmp_f_u64::<F>(self.regval(r1), self.regval(r2));
+    }
+    fn fto<F: Float>(&mut self, rd: Register, rs: Register)
+    where
+        u64: BitAccess<F::IntType>, {
+        let v = self.regval(rs);
+        self.regval_mut(rd).write(0, F::from_int(v as i64).to_bits());
+    }
+    fn ffrom<F: Float>(&mut self, rd: Register, rs: Register)
+    where
+        u64: BitAccess<F::IntType>, {
+        *self.regval_mut(rd) = F::from_bits_u64(self.regval(rs)).to_int() as u64;
+    }
+    fn fmonadic<F: Float>(&mut self, rd: Register, rs: Register, op: impl Fn(F) -> F)
+    where
+        u64: BitAccess<F::IntType>, {
+        let v = op(F::from_bits_u64(self.regval(rs)));
+        self.regval_mut(rd).write(0, v.to_bits());
+    }
+    fn fdyadic<F: Float>(&mut self, rd: Register, r1: Register, r2: Register, op: impl Fn(F, F) -> F)
+    where
+        u64: BitAccess<F::IntType>, {
+        let v = op(F::from_bits_u64(self.regval(r1)), F::from_bits_u64(self.regval(r2)));
+        self.regval_mut(rd).write(0, v.to_bits());
+    }
+    fn fma<F: Float>(&mut self, rd: Register, r1: Register, r2: Register)
+    where
+        u64: BitAccess<F::IntType>, {
+        let v = F::from_bits_u64(self.regval(rd)) + F::from_bits_u64(self.regval(r1)) * F::from_bits_u64(self.regval(r2));
+        self.regval_mut(rd).write(0, v.to_bits());
+    }
+    fn fcnv<To: Float + FloatFrom<From>, From: Float>(&mut self, rd: Register, r1: Register)
+    where
+        u64: BitAccess<To::IntType> + BitAccess<From::IntType>, {
+        let v = From::from_bits_u64(self.regval(r1));
+        self.regval_mut(rd).write(0, To::from(v).to_bits());
+    }
+    fn fnan<F: Float>(&mut self, rd: Register, r1: Register)
+    where
+        u64: BitAccess<F::IntType>, {
+        let v = F::from_bits_u64(self.regval(r1)).is_nan();
+        *self.regval_mut(rd) = v as u64;
     }
 
-    fn add(&mut self, a: u64, b: u64, reg: usize) {
+    fn add(&mut self, a: u64, b: u64, reg: Register) {
         let (v, u_overflow) = overflowing_add_unsigned(a, b, self.cpu.get_flag(StFlag::CARRY_BORROW_UNSIGNED));
-        *self.regval_mut_n(reg) = v;
+        *self.regval_mut(reg) = v;
         self.cpu.set_flag(StFlag::CARRY_BORROW_UNSIGNED, u_overflow);
 
         let (v, s_overflow) = overflowing_add_signed(a as i64, b as i64, self.cpu.get_flag(StFlag::CARRY_BORROW_UNSIGNED));
-        *self.regval_mut_n(reg) = v as u64;
+        *self.regval_mut(reg) = v as u64;
         self.cpu.set_flag(StFlag::CARRY_BORROW, s_overflow);
     }
-    fn sub(&mut self, a: u64, b: u64, reg: usize) {
+    fn sub(&mut self, a: u64, b: u64, reg: Register) {
         let (v, u_overflow) = overflowing_sub_unsigned(a, b, self.cpu.get_flag(StFlag::CARRY_BORROW_UNSIGNED));
-        *self.regval_mut_n(reg) = v;
+        *self.regval_mut(reg) = v;
         self.cpu.set_flag(StFlag::CARRY_BORROW_UNSIGNED, u_overflow);
 
         let (v, s_overflow) = overflowing_sub_signed(a as i64, b as i64, self.cpu.get_flag(StFlag::CARRY_BORROW_UNSIGNED));
-        *self.regval_mut_n(reg) = v as u64;
+        *self.regval_mut(reg) = v as u64;
         self.cpu.set_flag(StFlag::CARRY_BORROW, s_overflow);
     }
-    fn imul(&mut self, a: u64, b: u64, reg: usize) { *self.regval_mut_n(reg) = ((a as i64) * (b as i64)) as u64; }
-    fn idiv(&mut self, a: u64, b: u64, reg: usize) { *self.regval_mut_n(reg) = ((a as i64) / (b as i64)) as u64; }
-    fn umul(&mut self, a: u64, b: u64, reg: usize) { *self.regval_mut_n(reg) = a * b; }
-    fn udiv(&mut self, a: u64, b: u64, reg: usize) { *self.regval_mut_n(reg) = a / b; }
-    fn rem(&mut self, a: u64, b: u64, reg: usize) { *self.regval_mut_n(reg) = ((a as i64) % (b as i64)) as u64; }
-    fn r#mod(&mut self, a: u64, b: u64, reg: usize) {
+    fn imul(&mut self, a: u64, b: u64, reg: Register) { *self.regval_mut(reg) = ((a as i64) * (b as i64)) as u64; }
+    fn idiv(&mut self, a: u64, b: u64, reg: Register) { *self.regval_mut(reg) = ((a as i64) / (b as i64)) as u64; }
+    fn umul(&mut self, a: u64, b: u64, reg: Register) { *self.regval_mut(reg) = a * b; }
+    fn udiv(&mut self, a: u64, b: u64, reg: Register) { *self.regval_mut(reg) = a / b; }
+    fn rem(&mut self, a: u64, b: u64, reg: Register) { *self.regval_mut(reg) = ((a as i64) % (b as i64)) as u64; }
+    fn r#mod(&mut self, a: u64, b: u64, reg: Register) {
         if b as i64 == -1 {
-            *self.regval_mut_n(reg) = 0;
+            *self.regval_mut(reg) = 0;
         } else {
-            *self.regval_mut_n(reg) = ((a as i64).rem_euclid(b as i64)) as u64;
+            *self.regval_mut(reg) = ((a as i64).rem_euclid(b as i64)) as u64;
         }
     }
-    fn and(&mut self, a: u64, b: u64, reg: usize) { *self.regval_mut_n(reg) = a & b; }
-    fn or(&mut self, a: u64, b: u64, reg: usize) { *self.regval_mut_n(reg) = a | b; }
-    fn nor(&mut self, a: u64, b: u64, reg: usize) { *self.regval_mut_n(reg) = !(a | b); }
-    fn xor(&mut self, a: u64, b: u64, reg: usize) { *self.regval_mut_n(reg) = a ^ b; }
-    fn shl(&mut self, a: u64, b: u64, reg: usize) { *self.regval_mut_n(reg) = a << b; }
-    fn sar(&mut self, a: u64, b: u64, reg: usize) { *self.regval_mut_n(reg) = ((a as i64) >> b) as u64; }
-    fn shr(&mut self, a: u64, b: u64, reg: usize) { *self.regval_mut_n(reg) = a >> b; }
-    fn bit(&mut self, a: u64, b: u64, reg: usize) { *self.regval_mut_n(reg) = (a >> b) & 1; }
-    fn fcomp<F: Float>(&mut self, ci: Instruction) {
-        let a = F::from_bits_u64(self.regval_n(get_usize!(ci.m.rde)));
-        let b = F::from_bits_u64(self.regval_n(get_usize!(ci.m.rs1)));
-        make_comp!(self, a, b, F);
-    }
-    // int -> float cast
-    fn fto<F: Float>(&mut self, ci: Instruction) {
-        let from = self.regval_n(get_usize!(ci.e.rs1));
-        let to = self.regval_mut_n(get_usize!(ci.e.rde));
-        F::from_int(from).to_bits_to_u64(to);
-    }
-    // float -> int cast
-    fn ffrom<F: Float>(&mut self, ci: Instruction) {
-        let from = self.regval_n(get_usize!(ci.e.rs1));
-        let to = self.regval_mut_n(get_usize!(ci.e.rde));
-        *to = F::from_bits_u64(from).to_int();
-    }
-    fn fneg<F: Float>(&mut self, ci: Instruction) {
-        let from = self.regval_n(get_usize!(ci.e.rs1));
-        let to = self.regval_mut_n(get_usize!(ci.e.rde));
-        *to = F::from_bits_u64(from).neg().to_int();
-    }
-    fn fabs<F: Float>(&mut self, ci: Instruction) {
-        let from = self.regval_n(get_usize!(ci.e.rs1));
-        let to = self.regval_mut_n(get_usize!(ci.e.rde));
-        *to = F::from_bits_u64(from).abs().to_int();
-    }
-    fn fadd<F: Float>(&mut self, ci: Instruction) {
-        let a = self.regval_n(get_usize!(ci.e.rs1));
-        let b = self.regval_n(get_usize!(ci.e.rs2));
-        let to = self.regval_mut_n(get_usize!(ci.e.rde));
-        *to = F::from_bits_u64(a).add(F::from_bits_u64(b)).to_int();
-    }
-    fn fsub<F: Float>(&mut self, ci: Instruction) {
-        let a = self.regval_n(get_usize!(ci.e.rs1));
-        let b = self.regval_n(get_usize!(ci.e.rs2));
-        let to = self.regval_mut_n(get_usize!(ci.e.rde));
-        *to = F::from_bits_u64(a).sub(F::from_bits_u64(b)).to_int();
-    }
-    fn fmul<F: Float>(&mut self, ci: Instruction) {
-        let a = self.regval_n(get_usize!(ci.e.rs1));
-        let b = self.regval_n(get_usize!(ci.e.rs2));
-        let to = self.regval_mut_n(get_usize!(ci.e.rde));
-        *to = F::from_bits_u64(a).mul(F::from_bits_u64(b)).to_int();
-    }
-    fn fdiv<F: Float>(&mut self, ci: Instruction) {
-        let a = self.regval_n(get_usize!(ci.e.rs1));
-        let b = self.regval_n(get_usize!(ci.e.rs2));
-        let to = self.regval_mut_n(get_usize!(ci.e.rde));
-        if F::from_bits_u64(b).is_zero() {
-            self.push_interrupt(InterruptErr::DivideByZero);
-        } else {
-            *to = F::from_bits_u64(a).div(F::from_bits_u64(b)).to_int();
-        }
-    }
-    fn fma<F: Float>(&mut self, ci: Instruction) {
-        let a = self.regval_n(get_usize!(ci.e.rs1));
-        let b = self.regval_n(get_usize!(ci.e.rs2));
-        let to = self.regval_mut_n(get_usize!(ci.e.rde));
-        (F::from_bits_u64(a) * F::from_bits_u64(b)).add_assign_bits(to);
-    }
-    fn fsqrt<F: Float>(&mut self, ci: Instruction) {
-        let from = self.regval_n(get_usize!(ci.e.rs1));
-        let to = self.regval_mut_n(get_usize!(ci.e.rde));
-        *to = F::from_bits_u64(from).sqrt().to_int();
-    }
-    fn fmin<F: Float>(&mut self, ci: Instruction) {
-        let a = self.regval_n(get_usize!(ci.e.rs1));
-        let b = self.regval_n(get_usize!(ci.e.rs2));
-        let to = self.regval_mut_n(get_usize!(ci.e.rde));
-        *to = F::from_bits_u64(a).min(F::from_bits_u64(b)).to_int();
-    }
-    fn fmax<F: Float>(&mut self, ci: Instruction) {
-        let a = self.regval_n(get_usize!(ci.e.rs1));
-        let b = self.regval_n(get_usize!(ci.e.rs2));
-        let to = self.regval_mut_n(get_usize!(ci.e.rde));
-        *to = F::from_bits_u64(a).max(F::from_bits_u64(b)).to_int();
-    }
-    fn fsat<F: Float>(&mut self, ci: Instruction) {
-        let from = self.regval_n(get_usize!(ci.e.rs1));
-        let to = self.regval_mut_n(get_usize!(ci.e.rde));
-        *to = F::from_bits_u64(from).ceil().to_int();
-    }
-    fn fconvert<From: Float, To: FloatFrom<From>>(&mut self, ci: Instruction) {
-        let from = self.regval_n(get_usize!(ci.e.rs1));
-        let to = self.regval_mut_n(get_usize!(ci.e.rde));
-        To::from(From::from_bits_u64(from)).to_bits_to_u64(to);
-    }
-    fn fnan<F: Float>(&mut self, ci: Instruction) {
-        let from = self.regval_n(get_usize!(ci.e.rs1));
-        let to = self.regval_mut_n(get_usize!(ci.e.rde));
-        *to = F::from_bits_u64(from).is_nan() as u64;
-    }
+    fn and(&mut self, a: u64, b: u64, reg: Register) { *self.regval_mut(reg) = a & b; }
+    fn or(&mut self, a: u64, b: u64, reg: Register) { *self.regval_mut(reg) = a | b; }
+    fn nor(&mut self, a: u64, b: u64, reg: Register) { *self.regval_mut(reg) = !(a | b); }
+    fn xor(&mut self, a: u64, b: u64, reg: Register) { *self.regval_mut(reg) = a ^ b; }
+    fn shl(&mut self, a: u64, b: u64, reg: Register) { *self.regval_mut(reg) = a << b; }
+    fn sar(&mut self, a: u64, b: u64, reg: Register) { *self.regval_mut(reg) = ((a as i64) >> b) as u64; }
+    fn shr(&mut self, a: u64, b: u64, reg: Register) { *self.regval_mut(reg) = a >> b; }
+    fn bit(&mut self, a: u64, b: u64, reg: Register) { *self.regval_mut(reg) = (a >> b) & 1; }
+
     /// takes ownership of self
-    pub fn run(mut self) -> RunStats {
+    pub(crate) fn run(mut self) -> RunStats {
         let now = Instant::now();
         if self.cycle_limit == 0 {
             while self.cpu.running {
@@ -1325,14 +885,11 @@ impl Emulator {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct InvalidInstructionError;
-
-#[derive(Debug, Clone, Copy)]
-pub struct RunStats {
-    pub elapsed: f64,
-    pub cycle:   u64,
+pub(crate) struct RunStats {
+    pub(crate) elapsed: f64,
+    pub(crate) cycle:   u64,
 }
 impl RunStats {
     #[allow(clippy::cast_precision_loss)]
-    pub fn cycle_per_sec(self) -> f64 { self.cycle as f64 / self.elapsed }
+    pub(crate) fn cycle_per_sec(self) -> f64 { self.cycle as f64 / self.elapsed }
 }
