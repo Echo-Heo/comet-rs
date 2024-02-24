@@ -300,18 +300,18 @@ pub(crate) struct Emulator {
     mmu: MMU,
     pub(crate) ioc: IOC,
 
-    // debug:       bool,
+    debug:       bool,
     // no_color:    bool,
     cycle_limit: usize,
 }
 impl Emulator {
-    pub(crate) const fn new(cpu: CPU, ic: IC, mmu: MMU, _debug: bool, cycle_limit: usize) -> Self {
+    pub(crate) const fn new(cpu: CPU, ic: IC, mmu: MMU, debug: bool, cycle_limit: usize) -> Self {
         Self {
             cpu,
             ic,
             mmu,
             ioc: IOC::new(),
-            // debug,
+            debug,
             // no_color: false,
             cycle_limit,
         }
@@ -480,7 +480,10 @@ impl Emulator {
     }
     fn run_internal(&mut self) {
         self.cpu.cycle += 1;
-        println!("[at {:#016x} {:02x}]", self.regval(RN::IP), self.current_instr().opcode());
+        
+        if self.debug {
+            println!("[at {:#016x} {:02x}]", self.regval(RN::IP), self.current_instr().opcode());
+        }
 
         // load instruction
         match self.read_instruction(self.regval(RN::IP)) {
