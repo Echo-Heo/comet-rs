@@ -482,7 +482,15 @@ impl Emulator {
         self.cpu.cycle += 1;
         
         if self.debug {
-            println!("[at {:#016x} {:02x}]", self.regval(RN::IP), self.current_instr().opcode());
+            for i in 0x0..=0xF {
+                if matches!(i, 3..=11 | 0) {
+                    continue;
+                }
+                let register = Register(Nibble(i));
+                print!("[{register}: {:#x}]", self.regval(register));
+            }
+            println!("[{:#010x}]", self.current_instr().0);
+            println!("[{:?}]", Opcode::from_instruction(self.current_instr()));
         }
 
         // load instruction
@@ -577,7 +585,7 @@ impl Emulator {
             Opcode::Retr { rs } => self.regval_write(rs, RN::IP),
             Opcode::B { cc, imm } => {
                 if cc.cond(|flag| self.cpu.get_flag(flag)) {
-                    *self.regval_mut(RN::IP) += (sign_extend!(imm, 20) as i64 * 4) as u64;
+                    *self.regval_mut(RN::IP) = self.regval(RN::IP).wrapping_add((sign_extend!(imm, 20) as i64 * 4) as u64);
                 }
             }
             Opcode::Push { rs } => self.push_stack_from(rs),

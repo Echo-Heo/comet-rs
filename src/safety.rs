@@ -125,10 +125,10 @@ impl_bit_access! {u8, u16, 8}
 impl_bit_access! {u8, u32, 8}
 impl_bit_access! {u8, u64, 8}
 impl_bit_access! {u8, usize, 8}
-impl_bit_access! {u16, u32, 8}
-impl_bit_access! {u16, u64, 8}
-impl_bit_access! {u16, usize, 8}
-impl_bit_access! {u32, u64, 8}
+impl_bit_access! {u16, u32, 16}
+impl_bit_access! {u16, u64, 16}
+impl_bit_access! {u16, usize, 16}
+impl_bit_access! {u32, u64, 32}
 
 /// Type guaranteed to have no upper bits;
 /// Do not use this to store things, only access and write nibbles
@@ -146,7 +146,7 @@ impl Nibble {
     pub(crate) const fn try_into_bool(self) -> Option<bool> {
         match self.0 {
             1 => Some(true),
-            2 => Some(false),
+            0 => Some(false),
             _ => None,
         }
     }
@@ -382,6 +382,30 @@ impl_register! {
         SP = 0xD;
         FP = 0xE;
         ST = 0xF;
+    }
+}
+impl Display for Register {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let str = match self.0.0 {
+            0x0 => "RZ",
+            0x1 => "RA",
+            0x2 => "RB",
+            0x3 => "RC", 
+            0x4 => "RD",
+            0x5 => "RE",
+            0x6 => "RF",
+            0x7 => "RG",
+            0x8 => "RH",
+            0x9 => "RI",
+            0xA => "RJ",
+            0xB => "RK",
+            0xC => "IP",
+            0xD => "SP",
+            0xE => "FP",
+            0xF => "ST",
+            _ => unreachable!()
+        };
+        write!(f, "{str}")
     }
 }
 
