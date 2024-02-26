@@ -2,10 +2,10 @@
 #![allow(clippy::cast_possible_truncation)]
 #![deny(unsafe_code)]
 
-use crate::{nth_bit, safety::Interrupt};
+use crate::safety::{nth_bit, Interrupt};
 use std::{
     fs::File,
-    io::{Read, Seek},
+    io,
     mem::size_of,
     path::{Path, PathBuf},
 };
@@ -60,14 +60,9 @@ impl MMU {
     }
     pub(crate) fn new(mem_cap: u64) -> Result<Self, MMUInitError> { Self::new_option(mem_cap).ok_or(MMUInitError) }
     pub(crate) fn load_image(&mut self, path: &Path) -> Result<(), LoadImageError> {
-        let mut bin = File::open(path).map_err(|_| LoadImageError::new_no_access(path))?;
-        let err_op = |_| LoadImageError::new_no_load(path);
-        let bin_size = bin.seek(std::io::SeekFrom::End(0)).map_err(err_op)?;
-        bin.seek(std::io::SeekFrom::Start(0)).map_err(err_op)?;
-        let ret_code = bin.read(&mut self.memory).map_err(err_op)?;
-        if bin_size != ret_code as u64 {
-            Err(LoadImageError::new_no_load(path))?;
-        }
+        let mut bin_file = File::open(path).map_err(|_| LoadImageError::new_no_access(path))?;
+        let mut memory = &mut *self.memory;
+        io::copy(&mut bin_file, &mut memory).map_err(|_| LoadImageError::new_no_load(path))?;
         Ok(())
     }
 
@@ -163,7 +158,7 @@ impl MMU {
             Ok(pde) if pde & 1 != 0 => pde,
             _ => return Err(Response::AccViolation),
         };
-        let auth_pde = if pde & nth_bit!(1) != 0 { pde } else { 0 };
+        let auth_pde = if pde & nth_bit(1) != 0 { pde } else { 0 };
         // get PDE
         // set authoritative perms
         // check perms
@@ -175,9 +170,9 @@ impl MMU {
 }
 
 fn has_perm(pde: u64, mode: AccessMode) -> bool {
-    !(pde & nth_bit!(2) == 0 && matches!(mode, AccessMode::Read)
-        || pde & nth_bit!(3) == 0 && matches!(mode, AccessMode::Write)
-        || pde & nth_bit!(4) == 0 && matches!(mode, AccessMode::Execute))
+    !(pde & nth_bit(2) == 0 && matches!(mode, AccessMode::Read)
+        || pde & nth_bit(3) == 0 && matches!(mode, AccessMode::Write)
+        || pde & nth_bit(4) == 0 && matches!(mode, AccessMode::Execute))
 }
 
 #[derive(Debug, Clone, Error)]

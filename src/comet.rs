@@ -18,27 +18,22 @@ use crate::{
     io::{Ports, IOC},
     mmu::{self, MMU},
     opcode::Opcode,
-    safety::{BitAccess, FloatCastType, FloatPrecision, Instruction, Interrupt, LiType, Nibble, Register},
+    safety::{nth_bit, BitAccess, FloatCastType, FloatPrecision, Instruction, Interrupt, LiType, Nibble, Register},
 };
 use half::f16;
 
-macro_rules! sign_extend {
-    ($val: expr, $bitsize: expr) => {
-        (((($val as u64) << (64 - $bitsize)) as i64) >> (64 - $bitsize)) as u64
-    };
+const fn sign_extend(val: u64, bit_size: u8) -> u64 {
+    let shift = (64 - bit_size) as u64;
+
+    (((val << shift) as i64) >> shift) as u64
 }
-/* macro_rules! zero_extend {
-    ($val: expr, $bitsize: expr) => {
-        (((($val as u64) << (64 - $bitsize)) as u64) >> (64 - $bitsize)) as u64
-    };
-} */
 
 macro_rules! arithmetic {
     ($self: ident.$func: ident (*$r1: ident, *$r2: ident) -> $rd: ident) => {
         $self.$func($self.regval($r1), $self.regval($r2), $rd)
     };
     ($self: ident.$func: ident (*$r1: ident, $imm: ident) -> $rd: ident) => {
-        $self.$func($self.regval($r1), sign_extend!($imm, 16), $rd)
+        $self.$func($self.regval($r1), sign_extend($imm.into(), 16), $rd)
     };
 }
 macro_rules! bitwise {
@@ -169,25 +164,19 @@ impl<T: Float> FloatFrom<T> for T {
     fn to(self) -> F { F::from(self) }
 } */
 
-#[macro_export]
-macro_rules! nth_bit {
-    ($n: expr) => {
-        1 << $n
-    };
-}
 bitflags! {
     #[derive(Debug, Clone, Copy)]
     pub(crate) struct StFlag: u64 {
-        const SIGN = nth_bit!(0);
-        const ZERO = nth_bit!(1);
-        const CARRY_BORROW = nth_bit!(2);
-        const CARRY_BORROW_UNSIGNED = nth_bit!(3);
-        const EQUAL = nth_bit!(4);
-        const LESS = nth_bit!(5);
-        const LESS_UNSIGNED = nth_bit!(6);
-        const MODE = nth_bit!(7);
+        const SIGN = nth_bit(0);
+        const ZERO = nth_bit(1);
+        const CARRY_BORROW = nth_bit(2);
+        const CARRY_BORROW_UNSIGNED = nth_bit(3);
+        const EQUAL = nth_bit(4);
+        const LESS = nth_bit(5);
+        const LESS_UNSIGNED = nth_bit(6);
+        const MODE = nth_bit(7);
 
-        const EXT_F = nth_bit!(31);
+        const EXT_F = nth_bit(31);
     }
 }
 
@@ -376,19 +365,19 @@ impl Emulator {
     fn read_to_u8_signed(&mut self, addr: u64, to: Register) -> Result<(), mmu::Response> {
         let v = self.read_u8(addr)?;
         self.regval_mut(to).write(0, v);
-        *self.regval_mut(to) = sign_extend!(self.regval(to), 8);
+        *self.regval_mut(to) = sign_extend(self.regval(to), 8);
         Ok(())
     }
     fn read_to_u16_signed(&mut self, addr: u64, to: Register) -> Result<(), mmu::Response> {
         let v = self.read_u16(addr)?;
         self.regval_mut(to).write(0, v);
-        *self.regval_mut(to) = sign_extend!(self.regval(to), 16);
+        *self.regval_mut(to) = sign_extend(self.regval(to), 16);
         Ok(())
     }
     fn read_to_u32_signed(&mut self, addr: u64, to: Register) -> Result<(), mmu::Response> {
         let v = self.read_u32(addr)?;
         self.regval_mut(to).write(0, v);
-        *self.regval_mut(to) = sign_extend!(self.regval(to), 32);
+        *self.regval_mut(to) = sign_extend(self.regval(to), 32);
         Ok(())
     }
     fn write_u8(&mut self, addr: u64, value: u8) -> Result<(), mmu::Response> {
@@ -542,7 +531,7 @@ impl Emulator {
     }
     fn get_load_address(&self, rs: Register, off: u8, rn: Register, sh: Nibble) -> u64 {
         // TODO: operator precedence?
-        self.regval(rs) + sign_extend!(off, 8) + (self.regval(rn) << (sh.0 as u64))
+        self.regval(rs) + sign_extend(off.into(), 8) + (self.regval(rn) << (sh.0 as u64))
     }
     // returned interrupt is ran through `push_interrupt`
     #[allow(clippy::too_many_lines)]
@@ -574,17 +563,17 @@ impl Emulator {
             }
             Opcode::Jal { rs, imm } => {
                 self.push_stack_from(RN::IP);
-                *self.regval_mut(RN::IP) = self.regval(rs) + (sign_extend!(imm, 16) as i64 * 4) as u64;
+                *self.regval_mut(RN::IP) = self.regval(rs) + (sign_extend(imm.into(), 16) as i64 * 4) as u64;
             }
             Opcode::Jalr { rd, rs, imm } => {
                 *self.regval_mut(rd) = self.regval(RN::IP);
-                *self.regval_mut(RN::IP) = self.regval(rs) + (sign_extend!(imm, 16) as i64 * 4) as u64;
+                *self.regval_mut(RN::IP) = self.regval(rs) + (sign_extend(imm.into(), 16) as i64 * 4) as u64;
             }
             Opcode::Ret => self.pop_stack_to(RN::IP),
             Opcode::Retr { rs } => self.regval_write(rs, RN::IP),
             Opcode::B { cc, imm } => {
                 if cc.cond(|flag| self.cpu.get_flag(flag)) {
-                    *self.regval_mut(RN::IP) = self.regval(RN::IP).wrapping_add((sign_extend!(imm, 20) as i64 * 4) as u64);
+                    *self.regval_mut(RN::IP) = self.regval(RN::IP).wrapping_add((sign_extend(imm.into(), 20) as i64 * 4) as u64);
                 }
             }
             Opcode::Push { rs } => self.push_stack_from(rs),
@@ -599,13 +588,13 @@ impl Emulator {
             }
             Opcode::Li { rd, func, imm } => match func {
                 LiType::Lli => self.regval_mut(rd).write(0, imm),
-                LiType::Llis => *self.regval_mut(rd) = sign_extend!(imm, 16),
+                LiType::Llis => *self.regval_mut(rd) = sign_extend(imm.into(), 16),
                 LiType::Lui => self.regval_mut(rd).write(1, imm),
-                LiType::Luis => *self.regval_mut(rd) = sign_extend!(imm, 16) << 16,
+                LiType::Luis => *self.regval_mut(rd) = sign_extend(imm.into(), 16) << 16,
                 LiType::Lti => self.regval_mut(rd).write(2, imm),
-                LiType::Ltis => *self.regval_mut(rd) = sign_extend!(imm, 16) << 32,
+                LiType::Ltis => *self.regval_mut(rd) = sign_extend(imm.into(), 16) << 32,
                 LiType::Ltui => self.regval_mut(rd).write(3, imm),
-                LiType::Ltuis => *self.regval_mut(rd) = sign_extend!(imm, 16) << 48,
+                LiType::Ltuis => *self.regval_mut(rd) = sign_extend(imm.into(), 16) << 48,
             },
             opcode @ (Opcode::Lw { rd, rs, rn, sh, off }
             | Opcode::Lh { rd, rs, rn, sh, off }
@@ -646,9 +635,9 @@ impl Emulator {
             Opcode::Cmpr { r1, r2 } => self.cpu.set_cmp_u64(self.regval(r1), self.regval(r2)),
             Opcode::Cmpi { r1, s, imm } => {
                 let (a, b) = if s {
-                    (sign_extend!(imm, 16), self.regval(r1))
+                    (sign_extend(imm.into(), 16), self.regval(r1))
                 } else {
-                    (self.regval(r1), sign_extend!(imm, 16))
+                    (self.regval(r1), sign_extend(imm.into(), 16))
                 };
                 self.cpu.set_cmp_u64(a, b);
             }
