@@ -3,7 +3,7 @@
 #![deny(unsafe_code)]
 
 
-use crate::{nth_bit, safety::Interrupt};
+use crate::safety::{nth_bit, Interrupt};
 use std::{
     fs::File,
     io,
@@ -159,7 +159,7 @@ impl MMU {
             Ok(pde) if pde & 1 != 0 => pde,
             _ => return Err(Response::AccViolation),
         };
-        let auth_pde = if pde & nth_bit!(1) != 0 { pde } else { 0 };
+        let auth_pde = if pde & nth_bit(1) != 0 { pde } else { 0 };
         // get PDE
         // set authoritative perms
         // check perms
@@ -171,9 +171,9 @@ impl MMU {
 }
 
 fn has_perm(pde: u64, mode: AccessMode) -> bool {
-    !(pde & nth_bit!(2) == 0 && matches!(mode, AccessMode::Read)
-        || pde & nth_bit!(3) == 0 && matches!(mode, AccessMode::Write)
-        || pde & nth_bit!(4) == 0 && matches!(mode, AccessMode::Execute))
+    !(pde & nth_bit(2) == 0 && matches!(mode, AccessMode::Read)
+        || pde & nth_bit(3) == 0 && matches!(mode, AccessMode::Write)
+        || pde & nth_bit(4) == 0 && matches!(mode, AccessMode::Execute))
 }
 
 #[derive(Debug, Clone, Error)]

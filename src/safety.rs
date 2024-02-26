@@ -8,11 +8,15 @@
 #![allow(clippy::cast_possible_wrap)]
 
 use std::{
-    fmt::Display,
+    fmt::{self, Display},
     ops::{BitAnd, BitOr, BitXor, Not},
 };
 
 use crate::comet::StFlag;
+
+pub const fn nth_bit(n: u64) -> u64 {
+    1 << n
+}
 
 #[allow(unused)]
 pub(crate) trait BitFrom<T: Copy>: Copy {
@@ -152,7 +156,7 @@ impl Nibble {
     }
 }
 impl Display for Nibble {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.0.fmt(f) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(f) }
 }
 impl BitAnd for Nibble {
     type Output = Self;
@@ -362,7 +366,7 @@ macro_rules! impl_register {
     };
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Register(pub(crate) Nibble);
 impl_register! {
     impl Register {
@@ -385,7 +389,7 @@ impl_register! {
     }
 }
 impl Display for Register {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let str = match self.0.0 {
             0x0 => "RZ",
             0x1 => "RA",
