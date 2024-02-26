@@ -43,7 +43,7 @@ struct Args {
 }
 
 
-fn comet_main() -> anyhow::Result<()> {
+pub fn comet_main() -> anyhow::Result<()> {
     let args = Args::try_parse()?;
     let mut mmu = MMU::new(args.memory as u64)?;
     let ic = IC::new();

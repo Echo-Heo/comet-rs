@@ -481,18 +481,6 @@ impl Emulator {
     fn run_internal(&mut self) {
         self.cpu.cycle += 1;
         
-        if self.debug {
-            for i in 0x0..=0xF {
-                if matches!(i, 3..=11 | 0) {
-                    continue;
-                }
-                let register = Register(Nibble(i));
-                print!("[{register}: {:#x}]", self.regval(register));
-            }
-            println!("[{:#010x}]", self.current_instr().0);
-            println!("[{:?}]", Opcode::from_instruction(self.current_instr()));
-        }
-
         // load instruction
         match self.read_instruction(self.regval(RN::IP)) {
             Ok(instr) => self.set_current_instr(instr),
@@ -500,6 +488,18 @@ impl Emulator {
                 self.push_interrupt_from_mmu(err);
                 return;
             }
+        }
+
+        if self.debug {
+            for i in 0x0..=0xF {
+                if matches!(i, 4..=11 | 0) {
+                    continue;
+                }
+                let register = Register(Nibble(i));
+                print!("[{register}: {:#x}]", self.regval(register));
+            }
+            println!("[{:#010x}]", self.current_instr().0);
+            println!("[{:?}]", Opcode::from_instruction(self.current_instr()));
         }
 
         *self.regval_mut(RN::IP) += 4;
