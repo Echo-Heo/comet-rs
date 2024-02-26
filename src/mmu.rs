@@ -77,7 +77,7 @@ impl MMU {
         } else if addr as usize % SIZE != 0 {
             Err(Response::Unaligned)
         } else {
-            Ok(self.memory[addr as usize..].first_chunk::<SIZE>().unwrap())
+            Ok(self.memory[addr as usize..][..SIZE].try_into().unwrap())
         }
     }
     pub(crate) fn phys_write_sized<const SIZE: usize>(&mut self, addr: u64, what: [u8; SIZE]) -> Result<(), Response> {
@@ -86,7 +86,7 @@ impl MMU {
         } else if addr as usize % SIZE != 0 {
             Err(Response::Unaligned)
         } else {
-            *self.memory[addr as usize..].first_chunk_mut::<SIZE>().unwrap() = what;
+            *<&mut [u8; SIZE]>::try_from(&mut self.memory[addr as usize..][..SIZE]).unwrap() = what;
             Ok(())
         }
     }
