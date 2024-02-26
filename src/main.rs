@@ -1,6 +1,5 @@
 #![allow(clippy::cast_possible_truncation)]
 #![deny(unsafe_code)]
-
 use clap::Parser;
 use comet::{Emulator, StFlag, CPU};
 use ic::IC;

@@ -6,7 +6,6 @@
 #![allow(clippy::cast_possible_wrap)]
 #![deny(unsafe_code)]
 
-
 use bitflags::bitflags;
 use std::{
     fmt::Debug,
@@ -295,9 +294,9 @@ fn overflowing_sub_signed(a: i64, b: i64, carry: bool) -> (i64, bool) {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Emulator {
-    cpu: CPU,
+    cpu:            CPU,
     pub(crate) ic:  IC,
-    mmu: MMU,
+    mmu:            MMU,
     pub(crate) ioc: IOC,
 
     debug:       bool,
@@ -480,7 +479,7 @@ impl Emulator {
     }
     fn run_internal(&mut self) {
         self.cpu.cycle += 1;
-        
+
         // load instruction
         match self.read_instruction(self.regval(RN::IP)) {
             Ok(instr) => self.set_current_instr(instr),
