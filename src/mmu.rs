@@ -6,7 +6,7 @@
 use crate::{nth_bit, safety::Interrupt};
 use std::{
     fs::File,
-    io::{Read, Seek},
+    io,
     mem::size_of,
     path::{Path, PathBuf},
 };
@@ -61,13 +61,9 @@ impl MMU {
     }
     pub(crate) fn new(mem_cap: u64) -> Result<Self, MMUInitError> { Self::new_option(mem_cap).ok_or(MMUInitError) }
     pub(crate) fn load_image(&mut self, path: &Path) -> anyhow::Result<()> {
-        let mut bin = File::open(path)?;
-        let bin_size = bin.seek(std::io::SeekFrom::End(0))?;
-        bin.seek(std::io::SeekFrom::Start(0))?;
-        let ret_code = bin.read(&mut self.memory)?;
-        if bin_size != ret_code as u64 {
-            Err(LoadImageError(path.to_owned()))?;
-        }
+        let mut bin_file = File::open(path)?;
+        let mut memory = &mut *self.memory;
+        io::copy(&mut bin_file, &mut memory)?;
         Ok(())
     }
 
