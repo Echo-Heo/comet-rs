@@ -7,7 +7,6 @@ description = "RIIR of https://github.com/orbit-systems/comet"
 publish = false
 
 [dependencies]
-anyhow = "1.0.80"
 bitflags = "2.4.2"
 clap = { version = "4.5.1", features = ["derive"] }
 half = { version = "2.3.1", features = ["std"] }

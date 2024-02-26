@@ -2,7 +2,6 @@
 #![allow(clippy::cast_possible_truncation)]
 #![deny(unsafe_code)]
 
-
 use crate::{nth_bit, safety::Interrupt};
 use std::{
     fs::File,
@@ -48,7 +47,7 @@ pub(crate) struct MMU {
     pub(crate) page_table_base: u64,
 }
 #[derive(Debug, Clone, Copy, Error)]
-#[error("")]
+#[error("Failed to initialize mmu")]
 pub(crate) struct MMUInitError;
 impl MMU {
     pub(crate) const fn mem_max(&self) -> u64 { (self.memory.len() - 1) as u64 }
@@ -60,13 +59,14 @@ impl MMU {
         Some(Self { memory, page_table_base: 0 })
     }
     pub(crate) fn new(mem_cap: u64) -> Result<Self, MMUInitError> { Self::new_option(mem_cap).ok_or(MMUInitError) }
-    pub(crate) fn load_image(&mut self, path: &Path) -> anyhow::Result<()> {
-        let mut bin = File::open(path)?;
-        let bin_size = bin.seek(std::io::SeekFrom::End(0))?;
-        bin.seek(std::io::SeekFrom::Start(0))?;
-        let ret_code = bin.read(&mut self.memory)?;
+    pub(crate) fn load_image(&mut self, path: &Path) -> Result<(), LoadImageError> {
+        let mut bin = File::open(path).map_err(|_| LoadImageError::new_no_access(path))?;
+        let err_op = |_| LoadImageError::new_no_load(path);
+        let bin_size = bin.seek(std::io::SeekFrom::End(0)).map_err(err_op)?;
+        bin.seek(std::io::SeekFrom::Start(0)).map_err(err_op)?;
+        let ret_code = bin.read(&mut self.memory).map_err(err_op)?;
         if bin_size != ret_code as u64 {
-            Err(LoadImageError(path.to_owned()))?;
+            Err(LoadImageError::new_no_load(path))?;
         }
         Ok(())
     }
@@ -181,5 +181,30 @@ fn has_perm(pde: u64, mode: AccessMode) -> bool {
 }
 
 #[derive(Debug, Clone, Error)]
-#[error("crash: accessed but could not load file \"{0}\" into memory (ask sandwichman about this)")]
-pub(crate) struct LoadImageError(pub(crate) PathBuf);
+#[error("crash: {error_type}; path: \"{path}\"")]
+pub(crate) struct LoadImageError {
+    path:       PathBuf,
+    error_type: LoadErrorType,
+}
+impl LoadImageError {
+    fn new_no_access(path: &Path) -> Self {
+        Self {
+            path:       path.to_owned(),
+            error_type: LoadErrorType::CouldNotAccess,
+        }
+    }
+    fn new_no_load(path: &Path) -> Self {
+        Self {
+            path:       path.to_owned(),
+            error_type: LoadErrorType::CouldNotLoad,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, Error)]
+enum LoadErrorType {
+    #[error("could not access file")]
+    CouldNotAccess,
+    #[error("accessed but could not load file into memory")]
+    CouldNotLoad,
+}
