@@ -1,7 +1,6 @@
 #![warn(clippy::pedantic)]
 #![deny(unsafe_code)]
 
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct IntQueueEntry {
     pub(crate) code: u8,

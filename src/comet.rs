@@ -283,9 +283,9 @@ fn overflowing_sub_signed(a: i64, b: i64, carry: bool) -> (i64, bool) {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Emulator {
-    cpu: CPU,
+    cpu:            CPU,
     pub(crate) ic:  IC,
-    mmu: MMU,
+    mmu:            MMU,
     pub(crate) ioc: IOC,
 
     debug:       bool,
@@ -480,7 +480,7 @@ impl Emulator {
 
         if self.debug {
             for i in 0x0..=0xF {
-                if matches!(i, 3..=11 | 0) {
+                if matches!(i, 4..=11 | 0) {
                     continue;
                 }
                 let register = Register(Nibble(i));

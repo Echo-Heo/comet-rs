@@ -1,11 +1,11 @@
 #![allow(clippy::cast_possible_truncation)]
 #![deny(unsafe_code)]
-
 use clap::Parser;
 use comet::{Emulator, StFlag, CPU};
 use ic::IC;
-use mmu::MMU;
+use mmu::{LoadImageError, MMUInitError, MMU};
 use std::path::PathBuf;
+use thiserror::Error;
 
 mod comet;
 mod ic;
@@ -42,8 +42,26 @@ struct Args {
     bench: bool,
 }
 
+#[derive(Debug, Error)]
+enum CometErr {
+    #[error("{0}")]
+    ArgParse(clap::Error),
+    #[error("{0}")]
+    MMUInit(MMUInitError),
+    #[error("{0}")]
+    FileLoad(LoadImageError),
+}
+impl From<clap::Error> for CometErr {
+    fn from(value: clap::Error) -> Self { Self::ArgParse(value) }
+}
+impl From<MMUInitError> for CometErr {
+    fn from(value: MMUInitError) -> Self { Self::MMUInit(value) }
+}
+impl From<LoadImageError> for CometErr {
+    fn from(value: LoadImageError) -> Self { Self::FileLoad(value) }
+}
 
-fn comet_main() -> anyhow::Result<()> {
+fn comet_main() -> Result<(), CometErr> {
     let args = Args::try_parse()?;
     let mut mmu = MMU::new(args.memory as u64)?;
     let ic = IC::new();

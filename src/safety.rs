@@ -1,6 +1,5 @@
 #![warn(clippy::pedantic)]
 #![deny(unsafe_code)]
-
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_lossless)]
 #![allow(clippy::cast_precision_loss)]
@@ -209,7 +208,6 @@ impl BitAccess<bool> for Nibble {
     }
 }
 
-
 /// ```plain
 ///     31..28 │ 27..24 │ 23..20 │ 19..16 │           15..8 │            7..0 │
 /// E │    rde │    rs1 │    rs2 │   func │            imm8 │          opcode │
@@ -394,7 +392,7 @@ impl Display for Register {
             0x0 => "RZ",
             0x1 => "RA",
             0x2 => "RB",
-            0x3 => "RC", 
+            0x3 => "RC",
             0x4 => "RD",
             0x5 => "RE",
             0x6 => "RF",
@@ -407,7 +405,7 @@ impl Display for Register {
             0xD => "SP",
             0xE => "FP",
             0xF => "ST",
-            _ => unreachable!()
+            _ => unreachable!(),
         };
         write!(f, "{str}")
     }
@@ -415,7 +413,6 @@ impl Display for Register {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Port(pub(crate) u16);
-
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum BranchCond {
@@ -474,8 +471,8 @@ impl BranchCond {
             Self::Le => get_flag(StFlag::LESS) || get_flag(StFlag::EQUAL),
             Self::Ltu => get_flag(StFlag::LESS_UNSIGNED),
             Self::Leu => get_flag(StFlag::LESS_UNSIGNED) || get_flag(StFlag::EQUAL),
-            Self::Ne => get_flag(!StFlag::EQUAL),
-            Self::Nz => get_flag(!StFlag::ZERO),
+            Self::Ne => !get_flag(StFlag::EQUAL),
+            Self::Nz => !get_flag(StFlag::ZERO),
             Self::Ge => !get_flag(StFlag::LESS),
             Self::Gt => !get_flag(StFlag::LESS) && !get_flag(StFlag::EQUAL),
             Self::Geu => !get_flag(StFlag::LESS_UNSIGNED),
@@ -543,4 +540,3 @@ impl FloatCastType {
 impl From<u64> for Port {
     fn from(value: u64) -> Self { Port(value as u16) }
 }
-
